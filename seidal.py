@@ -342,7 +342,9 @@ HTML_TEMPLATE = '''
 
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f093fb 100%);
+            background: radial-gradient(circle at top left, #7c3aed 0%, transparent 45%),
+                        radial-gradient(circle at 85% 15%, #0ea5e9 0%, transparent 35%),
+                        linear-gradient(135deg, #1e1b4b 0%, #312e81 45%, #4c1d95 100%);
             min-height: 100vh;
             padding: 40px 20px;
             display: flex;
@@ -354,28 +356,26 @@ HTML_TEMPLATE = '''
         body::before {
             content: '';
             position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: 
-                radial-gradient(circle at 20% 50%, rgba(120, 119, 198, 0.3) 0%, transparent 50%),
-                radial-gradient(circle at 80% 80%, rgba(252, 163, 17, 0.3) 0%, transparent 50%),
-                radial-gradient(circle at 40% 20%, rgba(59, 130, 246, 0.3) 0%, transparent 50%);
+            inset: 0;
+            background-image: linear-gradient(rgba(255,255,255,0.05) 1px, transparent 1px),
+                              linear-gradient(90deg, rgba(255,255,255,0.05) 1px, transparent 1px);
+            background-size: 30px 30px;
+            mask-image: radial-gradient(circle at center, black, transparent 85%);
             pointer-events: none;
         }
 
         .container {
-            background: rgba(255, 255, 255, 0.98);
-            backdrop-filter: blur(10px);
-            border-radius: 16px;
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1), 0 2px 8px rgba(0, 0, 0, 0.05);
-            max-width: 1000px;
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(12px);
+            border-radius: 22px;
+            box-shadow: 0 30px 70px rgba(15, 23, 42, 0.35), 0 8px 24px rgba(15, 23, 42, 0.2);
+            max-width: 1100px;
             width: 100%;
             padding: 48px;
             animation: slideIn 0.4s ease-out;
             position: relative;
-            border: 1px solid rgba(255, 255, 255, 0.5);
+            border: 1px solid rgba(255, 255, 255, 0.8);
+            overflow: hidden;
         }
 
         @keyframes slideIn {
@@ -390,37 +390,69 @@ HTML_TEMPLATE = '''
         }
 
         .header {
-            margin-bottom: 40px;
-            border-bottom: 2px solid transparent;
-            border-image: linear-gradient(90deg, #667eea, #764ba2, #f093fb);
-            border-image-slice: 1;
-            padding-bottom: 24px;
+            margin-bottom: 28px;
+            padding: 28px;
+            border-radius: 18px;
+            background: linear-gradient(135deg, #312e81 0%, #5b21b6 52%, #0284c7 100%);
+            box-shadow: 0 12px 28px rgba(49, 46, 129, 0.35);
+            color: white;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .header::after {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: radial-gradient(circle at 80% 20%, rgba(255,255,255,0.25), transparent 50%);
+            pointer-events: none;
         }
 
         h1 {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f093fb 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-            font-size: 32px;
-            font-weight: 700;
+            color: #ffffff;
+            font-size: 34px;
+            font-weight: 800;
             margin-bottom: 8px;
-            letter-spacing: -0.5px;
+            letter-spacing: -0.6px;
+            text-shadow: 0 4px 20px rgba(15, 23, 42, 0.25);
         }
 
         .subtitle {
-            color: #6b7280;
+            color: rgba(255,255,255,0.92);
             font-size: 14px;
-            font-weight: 400;
+            font-weight: 500;
+            max-width: 640px;
+        }
+
+        .hero-tags {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 16px;
+            position: relative;
+            z-index: 1;
+        }
+
+        .hero-tag {
+            border: 1px solid rgba(255,255,255,0.45);
+            color: white;
+            background: rgba(255,255,255,0.14);
+            border-radius: 999px;
+            padding: 6px 12px;
+            font-size: 12px;
+            font-weight: 700;
+            backdrop-filter: blur(3px);
+            letter-spacing: 0.2px;
         }
 
         .mode-selector {
             display: inline-flex;
-            background: linear-gradient(135deg, #f3f4f6 0%, #e5e7eb 100%);
-            border-radius: 10px;
-            padding: 4px;
-            margin-bottom: 32px;
-            box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.06);
+            background: #eef2ff;
+            border-radius: 12px;
+            padding: 5px;
+            margin-bottom: 26px;
+            box-shadow: inset 0 2px 6px rgba(79, 70, 229, 0.15);
+            border: 1px solid #c7d2fe;
         }
 
         .mode-btn {
@@ -449,29 +481,22 @@ HTML_TEMPLATE = '''
         }
 
         .input-section {
-            background: linear-gradient(135deg, #fafbfc 0%, #f8f9fa 100%);
-            border: 2px solid transparent;
-            background-clip: padding-box;
+            background: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
+            border: 1px solid #dbeafe;
             position: relative;
             padding: 28px;
-            border-radius: 12px;
+            border-radius: 14px;
             margin-bottom: 24px;
             animation: expandIn 0.3s ease-out;
+            box-shadow: 0 10px 24px rgba(37, 99, 235, 0.08);
         }
 
         .input-section::before {
             content: '';
             position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            border-radius: 12px;
-            padding: 2px;
-            background: linear-gradient(135deg, #667eea, #764ba2, #f093fb);
-            -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
-            -webkit-mask-composite: xor;
-            mask-composite: exclude;
+            inset: 0;
+            border-radius: 14px;
+            border: 1px solid rgba(99, 102, 241, 0.15);
             pointer-events: none;
         }
 
@@ -643,14 +668,14 @@ HTML_TEMPLATE = '''
         }
 
         .results-header {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, #3730a3 0%, #7c3aed 60%, #0284c7 100%);
             color: white;
             padding: 18px 24px;
-            border-radius: 10px 10px 0 0;
+            border-radius: 12px 12px 0 0;
             font-size: 16px;
             font-weight: 700;
             letter-spacing: 0.5px;
-            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
+            box-shadow: 0 8px 20px rgba(67, 56, 202, 0.35);
         }
 
         .results-content {
@@ -888,20 +913,22 @@ HTML_TEMPLATE = '''
 
         .history-panel {
             margin-top: 20px;
-            background: #f8fafc;
-            border: 2px solid #cbd5e1;
-            border-radius: 12px;
+            background: linear-gradient(135deg, #eef2ff 0%, #f0f9ff 100%);
+            border: 1px solid #bfdbfe;
+            border-radius: 14px;
             padding: 18px;
+            box-shadow: 0 8px 24px rgba(14, 116, 144, 0.12);
         }
 
         .history-item {
-            border: 1px solid #dbeafe;
+            border: 1px solid #c7d2fe;
             background: white;
-            border-radius: 10px;
-            padding: 12px;
+            border-radius: 12px;
+            padding: 14px;
             margin-bottom: 10px;
             font-size: 13px;
             color: #1f2937;
+            box-shadow: 0 4px 14px rgba(99, 102, 241, 0.08);
         }
 
         .history-item:last-child {
@@ -909,15 +936,38 @@ HTML_TEMPLATE = '''
         }
 
         .history-title {
-            font-weight: 700;
-            color: #1d4ed8;
-            margin-bottom: 8px;
+            font-weight: 800;
+            color: #312e81;
+            margin-bottom: 10px;
+            font-size: 15px;
+            letter-spacing: 0.3px;
         }
 
         .history-meta {
             font-family: 'SF Mono', Monaco, Consolas, monospace;
             color: #374151;
             margin-bottom: 6px;
+        }
+
+        .history-status {
+            display: inline-block;
+            margin-top: 6px;
+            padding: 4px 10px;
+            border-radius: 999px;
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.2px;
+            text-transform: uppercase;
+        }
+
+        .history-status.ok {
+            background: #dcfce7;
+            color: #166534;
+        }
+
+        .history-status.warn {
+            background: #fee2e2;
+            color: #991b1b;
         }
 
         .diagnostics-panel {
@@ -1019,7 +1069,12 @@ HTML_TEMPLATE = '''
     <div class="container">
         <div class="header">
             <h1>Gauss-Seidel Iterative Solver</h1>
-            <p class="subtitle">Numerical solution for systems of linear equations</p>
+            <p class="subtitle">Numerical solution for systems of linear equations with live diagnostics and saved history.</p>
+            <div class="hero-tags">
+                <span class="hero-tag">Fast Iteration Tracking</span>
+                <span class="hero-tag">Residual Diagnostics</span>
+                <span class="hero-tag">Persistent History</span>
+            </div>
         </div>
 
         <div class="mode-selector">
@@ -1284,6 +1339,7 @@ HTML_TEMPLATE = '''
                 html += `<div class="history-meta">#${item.id} • ${item.createdAt}</div>`;
                 html += `<div><strong>Mode:</strong> ${item.mode} | <strong>tol:</strong> ${item.tol} | <strong>maxIter:</strong> ${item.maxIter}</div>`;
                 html += `<div><strong>Status:</strong> ${item.converged ? 'Converged' : 'Not converged'} in ${item.iterCount} iterations</div>`;
+                html += `<span class="history-status ${item.converged ? 'ok' : 'warn'}">${item.converged ? 'stable result' : 'needs tuning'}</span>`;
                 html += `<div><strong>Solution:</strong> ${solutionText}</div>`;
                 if (item.diagnostics && item.diagnostics.residualInfinityNorm !== undefined) {
                     html += `<div><strong>Residual ||Ax-b||∞:</strong> ${Number(item.diagnostics.residualInfinityNorm).toExponential(3)}</div>`;
