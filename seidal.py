@@ -167,6 +167,64 @@ def gauss_seidel(
     }
 
 
+def analyze_system(A: list, b: list, x: list) -> dict:
+    """Return diagnostics that explain numerical stability and solution quality."""
+    n = len(A)
+    row_metrics = []
+    min_margin = float('inf')
+    strict_rows = 0
+    weak_rows = 0
+
+    for i in range(n):
+        diag = abs(A[i][i])
+        off_diag = sum(abs(A[i][j]) for j in range(n) if j != i)
+        margin = diag - off_diag
+        ratio = (diag / off_diag) if off_diag > 0 else float('inf')
+        min_margin = min(min_margin, margin)
+
+        if diag > off_diag:
+            strict_rows += 1
+            status = 'strict'
+        elif isclose(diag, off_diag, rel_tol=1e-12, abs_tol=1e-12):
+            weak_rows += 1
+            status = 'weak'
+        else:
+            status = 'not_dominant'
+
+        row_metrics.append({
+            'row': i + 1,
+            'diagAbs': diag,
+            'offDiagAbs': off_diag,
+            'margin': margin,
+            'ratio': ratio,
+            'status': status,
+        })
+
+    residual_vector = []
+    for i in range(n):
+        lhs = sum(A[i][j] * x[j] for j in range(n))
+        residual_vector.append(lhs - b[i])
+
+    inf_norm = max(abs(r) for r in residual_vector) if residual_vector else 0.0
+
+    if strict_rows == n:
+        stability = 'excellent'
+    elif strict_rows + weak_rows == n:
+        stability = 'fair'
+    else:
+        stability = 'risky'
+
+    return {
+        'rowMetrics': row_metrics,
+        'strictDominantRows': strict_rows,
+        'weakDominantRows': weak_rows,
+        'minimumMargin': min_margin,
+        'residualVector': residual_vector,
+        'residualInfinityNorm': inf_norm,
+        'stability': stability,
+    }
+
+
 # ────────────────────────────────────────────────
 # Web Routes
 # ────────────────────────────────────────────────
@@ -700,6 +758,75 @@ HTML_TEMPLATE = '''
             box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
         }
 
+
+        .diagnostics-panel {
+            margin-top: 16px;
+            background: linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%);
+            border: 2px solid #fcd34d;
+            border-radius: 12px;
+            padding: 20px;
+        }
+
+        .diagnostics-panel h3 {
+            color: #92400e;
+            margin-bottom: 10px;
+            font-size: 16px;
+        }
+
+        .diagnostics-panel p {
+            color: #78350f;
+            font-size: 13px;
+            margin-bottom: 8px;
+        }
+
+        .diagnostics-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+            font-family: 'SF Mono', Monaco, Consolas, monospace;
+            font-size: 12px;
+            background: white;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+
+        .diagnostics-table th,
+        .diagnostics-table td {
+            border: 1px solid #fde68a;
+            padding: 8px;
+            text-align: center;
+        }
+
+        .diagnostics-table th {
+            background: #fef3c7;
+            color: #78350f;
+            font-weight: 700;
+        }
+
+        .status-pill {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 999px;
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+        }
+
+        .status-strict {
+            background: #dcfce7;
+            color: #166534;
+        }
+
+        .status-weak {
+            background: #fef3c7;
+            color: #92400e;
+        }
+
+        .status-not_dominant {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+
         @media (max-width: 768px) {
             body {
                 padding: 20px 16px;
@@ -769,6 +896,17 @@ HTML_TEMPLATE = '''
 
             <div class="info-box">
                 <strong>Input format:</strong> Enter equations in standard form (e.g., 2x + 3y - z = 5). Variables can be any letters.
+            </div>
+        </div>
+
+        <div class="input-section" style="margin-top: 0;">
+            <div class="form-group">
+                <label>Tolerance:</label>
+                <input type="number" id="tolerance" step="any" min="0.0000001" value="0.0001">
+            </div>
+            <div class="form-group">
+                <label>Maximum Iterations:</label>
+                <input type="number" id="maxIterations" min="1" max="5000" value="1000">
             </div>
         </div>
 
@@ -881,7 +1019,13 @@ HTML_TEMPLATE = '''
             resultsDiv.style.display = 'none';
 
             try {
-                let requestData = { mode: currentMode };
+                const tolerance = parseFloat(document.getElementById('tolerance').value);
+                const maxIterations = parseInt(document.getElementById('maxIterations').value);
+
+                if (isNaN(tolerance) || tolerance <= 0) throw new Error('Tolerance must be a positive number');
+                if (isNaN(maxIterations) || maxIterations < 1) throw new Error('Maximum iterations must be at least 1');
+
+                let requestData = { mode: currentMode, tol: tolerance, maxIter: maxIterations };
 
                 if (currentMode === 'matrix') {
                     const n = parseInt(document.getElementById('matrixSize').value);
@@ -966,6 +1110,37 @@ HTML_TEMPLATE = '''
 
             html += '</div>';
 
+            if (result.diagnostics) {
+                const d = result.diagnostics;
+                const stabilityText = {
+                    excellent: 'Excellent stability (strict diagonal dominance in every row).',
+                    fair: 'Fair stability (some rows are weakly dominant).',
+                    risky: 'Risky stability (non-dominant rows may slow or prevent convergence).'
+                };
+
+                html += '<div class="diagnostics-panel">';
+                html += '<h3>Competition Edge: Convergence Diagnostics</h3>';
+                html += `<p><strong>Stability grade:</strong> ${d.stability.toUpperCase()} — ${stabilityText[d.stability] || ''}</p>`;
+                html += `<p><strong>Minimum dominance margin:</strong> ${d.minimumMargin.toExponential(3)}</p>`;
+                html += `<p><strong>Residual ||Ax-b||∞:</strong> ${d.residualInfinityNorm.toExponential(3)}</p>`;
+
+                html += '<table class="diagnostics-table">';
+                html += '<tr><th>Row</th><th>|aᵢᵢ|</th><th>Σ|aᵢⱼ|, j≠i</th><th>Margin</th><th>Ratio</th><th>Status</th></tr>';
+                for (const row of d.rowMetrics) {
+                    const ratioText = Number.isFinite(row.ratio) ? row.ratio.toFixed(3) : '∞';
+                    html += '<tr>';
+                    html += `<td>${row.row}</td>`;
+                    html += `<td>${row.diagAbs.toFixed(4)}</td>`;
+                    html += `<td>${row.offDiagAbs.toFixed(4)}</td>`;
+                    html += `<td>${row.margin.toExponential(2)}</td>`;
+                    html += `<td>${ratioText}</td>`;
+                    html += `<td><span class="status-pill status-${row.status}">${row.status.replace('_', ' ')}</span></td>`;
+                    html += '</tr>';
+                }
+                html += '</table>';
+                html += '</div>';
+            }
+
             if (result.converged) {
                 html += '<div class="final-solution">';
                 html += `<h3>Solution <span class="badge">Converged in ${result.iterCount} iterations</span></h3>`;
@@ -1003,6 +1178,12 @@ def solve():
     try:
         data = request.json
         mode = data.get('mode')
+        tol = float(data.get('tol', 1e-4))
+        max_iter = int(data.get('maxIter', 1000))
+        if tol <= 0:
+            raise ValueError('Tolerance must be positive')
+        if max_iter < 1:
+            raise ValueError('Maximum iterations must be at least 1')
 
         if mode == 'matrix':
             A = data.get('A')
@@ -1037,8 +1218,9 @@ def solve():
         A, b = prepare_matrix(A, b)
 
         # Solve
-        result = gauss_seidel(A, b, variables)
+        result = gauss_seidel(A, b, variables, tol=tol, max_iter=max_iter)
         result['variables'] = variables
+        result['diagnostics'] = analyze_system(A, b, result['solution'])
 
         return jsonify(result)
 
