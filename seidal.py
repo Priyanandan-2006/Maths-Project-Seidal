@@ -365,15 +365,16 @@ HTML_TEMPLATE = '''
         }
 
         .container {
-            background: rgba(255, 255, 255, 0.95);
+            background: linear-gradient(145deg, rgba(255,255,255,0.9), rgba(224,231,255,0.85));
             backdrop-filter: blur(12px);
             border-radius: 22px;
-            box-shadow: 0 30px 70px rgba(15, 23, 42, 0.35), 0 8px 24px rgba(15, 23, 42, 0.2);
+            box-shadow: 0 30px 70px rgba(15, 23, 42, 0.45), 0 0 0 1px rgba(129,140,248,0.35), 0 0 40px rgba(56,189,248,0.2);
             max-width: 1100px;
             width: 100%;
             padding: 48px;
             animation: slideIn 0.4s ease-out;
             position: relative;
+            z-index: 2;
             border: 1px solid rgba(255, 255, 255, 0.8);
             overflow: hidden;
         }
@@ -1038,6 +1039,60 @@ HTML_TEMPLATE = '''
             color: #991b1b;
         }
 
+        .math-sky {
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            z-index: 0;
+            overflow: hidden;
+        }
+
+        .math-symbol {
+            position: absolute;
+            color: rgba(255,255,255,0.8);
+            font-weight: 800;
+            text-shadow: 0 0 16px rgba(147,197,253,0.9);
+            animation: floatMath var(--dur, 16s) linear infinite;
+            animation-delay: var(--delay, 0s);
+            transform: translateY(120vh) rotate(0deg);
+            user-select: none;
+        }
+
+        @keyframes floatMath {
+            0% {
+                transform: translateY(115vh) translateX(0) rotate(0deg) scale(0.9);
+                opacity: 0;
+            }
+            10% { opacity: 0.85; }
+            50% {
+                transform: translateY(50vh) translateX(20px) rotate(180deg) scale(1.05);
+            }
+            100% {
+                transform: translateY(-20vh) translateX(-14px) rotate(360deg) scale(0.9);
+                opacity: 0;
+            }
+        }
+
+        .header::before {
+            content: '🤖 solving equations in hyperspace...';
+            position: absolute;
+            right: 18px;
+            bottom: 12px;
+            font-size: 12px;
+            font-weight: 700;
+            color: rgba(255,255,255,0.9);
+            background: rgba(15,23,42,0.28);
+            border: 1px solid rgba(255,255,255,0.35);
+            border-radius: 999px;
+            padding: 6px 12px;
+            animation: pulseTag 1.8s ease-in-out infinite;
+        }
+
+        @keyframes pulseTag {
+            0%, 100% { transform: scale(1); opacity: 0.8; }
+            50% { transform: scale(1.04); opacity: 1; }
+        }
+
         @media (max-width: 768px) {
             body {
                 padding: 20px 16px;
@@ -1062,10 +1117,27 @@ HTML_TEMPLATE = '''
             .action-row {
                 grid-template-columns: 1fr;
             }
+
+            .header::before {
+                position: static;
+                display: inline-block;
+                margin-top: 10px;
+            }
         }
     </style>
 </head>
 <body>
+    <div class="math-sky" aria-hidden="true">
+        <span class="math-symbol" style="left:6%;font-size:32px;--dur:18s;--delay:0s">∑</span>
+        <span class="math-symbol" style="left:14%;font-size:24px;--dur:14s;--delay:2s">π</span>
+        <span class="math-symbol" style="left:22%;font-size:28px;--dur:17s;--delay:4s">√</span>
+        <span class="math-symbol" style="left:34%;font-size:26px;--dur:20s;--delay:1s">∞</span>
+        <span class="math-symbol" style="left:46%;font-size:30px;--dur:15s;--delay:3s">x²</span>
+        <span class="math-symbol" style="left:58%;font-size:22px;--dur:16s;--delay:5s">Δ</span>
+        <span class="math-symbol" style="left:68%;font-size:30px;--dur:19s;--delay:2.5s">∫</span>
+        <span class="math-symbol" style="left:78%;font-size:24px;--dur:13s;--delay:6s">≈</span>
+        <span class="math-symbol" style="left:88%;font-size:28px;--dur:21s;--delay:1.5s">θ</span>
+    </div>
     <div class="container">
         <div class="header">
             <h1>Gauss-Seidel Iterative Solver</h1>
