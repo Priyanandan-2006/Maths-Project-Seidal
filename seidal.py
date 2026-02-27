@@ -5,9 +5,106 @@ Integrates the original Python solver with the HTML interface
 
 from flask import Flask, render_template_string, request, jsonify
 import re
+import json
+import sqlite3
+from datetime import datetime
 from math import isclose
 
 app = Flask(__name__)
+
+
+DB_PATH = 'solver_history.db'
+
+
+def init_db() -> None:
+    """Create local SQLite table for solve history."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS solve_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                tol REAL NOT NULL,
+                max_iter INTEGER NOT NULL,
+                variables TEXT NOT NULL,
+                input_payload TEXT NOT NULL,
+                converged INTEGER NOT NULL,
+                iter_count INTEGER NOT NULL,
+                solution TEXT NOT NULL,
+                diagnostics TEXT NOT NULL
+            )
+            '''
+        )
+        conn.commit()
+
+
+def save_history_entry(entry: dict, result: dict) -> None:
+    """Persist one successful solve call into the history table."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            '''
+            INSERT INTO solve_history (
+                created_at, mode, tol, max_iter, variables, input_payload,
+                converged, iter_count, solution, diagnostics
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+                entry['mode'],
+                entry['tol'],
+                entry['maxIter'],
+                json.dumps(entry['variables']),
+                json.dumps(entry['input']),
+                int(result['converged']),
+                int(result['iterCount']),
+                json.dumps(result['solution']),
+                json.dumps(result.get('diagnostics', {})),
+            ),
+        )
+        conn.commit()
+
+
+def fetch_history(limit: int = 20) -> list:
+    """Return latest solve history entries."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            '''
+            SELECT id, created_at, mode, tol, max_iter, variables, input_payload,
+                   converged, iter_count, solution, diagnostics
+            FROM solve_history
+            ORDER BY id DESC
+            LIMIT ?
+            ''',
+            (limit,),
+        ).fetchall()
+
+    items = []
+    for row in rows:
+        items.append({
+            'id': row['id'],
+            'createdAt': row['created_at'],
+            'mode': row['mode'],
+            'tol': row['tol'],
+            'maxIter': row['max_iter'],
+            'variables': json.loads(row['variables']),
+            'input': json.loads(row['input_payload']),
+            'converged': bool(row['converged']),
+            'iterCount': row['iter_count'],
+            'solution': json.loads(row['solution']),
+            'diagnostics': json.loads(row['diagnostics']),
+        })
+    return items
+
+
+def clear_history() -> None:
+    """Delete all history entries."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute('DELETE FROM solve_history')
+        conn.commit()
+
+init_db()
 
 # ────────────────────────────────────────────────
 # Parse single equation → coefficients + constant
@@ -759,6 +856,70 @@ HTML_TEMPLATE = '''
         }
 
 
+
+        .action-row {
+            display: grid;
+            grid-template-columns: 1fr 180px 180px;
+            gap: 10px;
+            margin-top: 6px;
+        }
+
+        .secondary-btn {
+            padding: 14px;
+            border: none;
+            border-radius: 10px;
+            font-size: 14px;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            color: #1f2937;
+            background: linear-gradient(135deg, #e5e7eb 0%, #d1d5db 100%);
+        }
+
+        .secondary-btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 6px 16px rgba(17, 24, 39, 0.15);
+        }
+
+        .clear-btn {
+            background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%);
+            color: #7f1d1d;
+        }
+
+        .history-panel {
+            margin-top: 20px;
+            background: #f8fafc;
+            border: 2px solid #cbd5e1;
+            border-radius: 12px;
+            padding: 18px;
+        }
+
+        .history-item {
+            border: 1px solid #dbeafe;
+            background: white;
+            border-radius: 10px;
+            padding: 12px;
+            margin-bottom: 10px;
+            font-size: 13px;
+            color: #1f2937;
+        }
+
+        .history-item:last-child {
+            margin-bottom: 0;
+        }
+
+        .history-title {
+            font-weight: 700;
+            color: #1d4ed8;
+            margin-bottom: 8px;
+        }
+
+        .history-meta {
+            font-family: 'SF Mono', Monaco, Consolas, monospace;
+            color: #374151;
+            margin-bottom: 6px;
+        }
+
         .diagnostics-panel {
             margin-top: 16px;
             background: linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%);
@@ -847,6 +1008,10 @@ HTML_TEMPLATE = '''
             .mode-btn {
                 flex: 1;
             }
+
+            .action-row {
+                grid-template-columns: 1fr;
+            }
         }
     </style>
 </head>
@@ -910,11 +1075,16 @@ HTML_TEMPLATE = '''
             </div>
         </div>
 
-        <button class="solve-btn" onclick="solve()">
-            <span id="solveText">Compute Solution</span>
-        </button>
+        <div class="action-row">
+            <button class="solve-btn" onclick="solve()">
+                <span id="solveText">Compute Solution</span>
+            </button>
+            <button class="secondary-btn" onclick="toggleHistory()">View History</button>
+            <button class="secondary-btn clear-btn" onclick="clearHistoryRecords()">Clear History</button>
+        </div>
 
         <div id="results" style="display: none;"></div>
+        <div id="historyPanel" class="history-panel" style="display: none;"></div>
     </div>
 
     <script>
@@ -1076,6 +1246,7 @@ HTML_TEMPLATE = '''
                 }
 
                 displayResults(result);
+                await loadHistory();
 
             } catch (error) {
                 resultsDiv.innerHTML = `<div class="error-message"><strong>Error:</strong> ${error.message}</div>`;
@@ -1083,6 +1254,59 @@ HTML_TEMPLATE = '''
             } finally {
                 solveBtn.disabled = false;
                 solveText.innerHTML = 'Compute Solution';
+            }
+        }
+
+
+        async function loadHistory() {
+            const historyPanel = document.getElementById('historyPanel');
+            const response = await fetch('/history');
+            const payload = await response.json();
+
+            if (payload.error) {
+                historyPanel.innerHTML = `<div class="error-message"><strong>Error:</strong> ${payload.error}</div>`;
+                return;
+            }
+
+            const items = payload.history || [];
+            if (items.length === 0) {
+                historyPanel.innerHTML = '<div class="history-item">No saved calculations yet. Solve a system to build your history.</div>';
+                return;
+            }
+
+            let html = '<div class="history-title">Saved Calculation History</div>';
+            for (const item of items) {
+                const solutionText = item.variables
+                    .map((name, idx) => `${name}=${Number(item.solution[idx]).toFixed(4)}`)
+                    .join(', ');
+
+                html += '<div class="history-item">';
+                html += `<div class="history-meta">#${item.id} • ${item.createdAt}</div>`;
+                html += `<div><strong>Mode:</strong> ${item.mode} | <strong>tol:</strong> ${item.tol} | <strong>maxIter:</strong> ${item.maxIter}</div>`;
+                html += `<div><strong>Status:</strong> ${item.converged ? 'Converged' : 'Not converged'} in ${item.iterCount} iterations</div>`;
+                html += `<div><strong>Solution:</strong> ${solutionText}</div>`;
+                if (item.diagnostics && item.diagnostics.residualInfinityNorm !== undefined) {
+                    html += `<div><strong>Residual ||Ax-b||∞:</strong> ${Number(item.diagnostics.residualInfinityNorm).toExponential(3)}</div>`;
+                }
+                html += '</div>';
+            }
+            historyPanel.innerHTML = html;
+        }
+
+        async function toggleHistory() {
+            const historyPanel = document.getElementById('historyPanel');
+            const show = historyPanel.style.display === 'none';
+            historyPanel.style.display = show ? 'block' : 'none';
+            if (show) {
+                await loadHistory();
+            }
+        }
+
+        async function clearHistoryRecords() {
+            await fetch('/history/clear', { method: 'POST' });
+            const historyPanel = document.getElementById('historyPanel');
+            if (historyPanel.style.display !== 'none') {
+                await loadHistory();
             }
         }
 
@@ -1190,6 +1414,7 @@ def solve():
             b = data.get('b')
             n = len(A)
             variables = [chr(120 + i) for i in range(n)]  # x, y, z, ...
+            input_payload = {'A': A, 'b': b}
 
         elif mode == 'equation':
             equations = data.get('equations')
@@ -1210,6 +1435,7 @@ def solve():
                 coeffs, const = parse_equation(eq, var_to_idx)
                 A.append(coeffs)
                 b.append(const)
+            input_payload = {'equations': equations}
         
         else:
             return jsonify({'error': 'Invalid mode'}), 400
@@ -1222,8 +1448,40 @@ def solve():
         result['variables'] = variables
         result['diagnostics'] = analyze_system(A, b, result['solution'])
 
+        save_history_entry(
+            {
+                'mode': mode,
+                'tol': tol,
+                'maxIter': max_iter,
+                'variables': variables,
+                'input': input_payload,
+            },
+            result,
+        )
+
         return jsonify(result)
 
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
+
+
+@app.route('/history', methods=['GET'])
+def history():
+    """Return latest solver calculations from SQLite history."""
+    try:
+        limit = int(request.args.get('limit', 20))
+        limit = max(1, min(limit, 100))
+        return jsonify({'history': fetch_history(limit)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
+
+
+@app.route('/history/clear', methods=['POST'])
+def clear_history_route():
+    """Clear all persisted history entries."""
+    try:
+        clear_history()
+        return jsonify({'ok': True})
     except Exception as e:
         return jsonify({'error': str(e)}), 400
 
