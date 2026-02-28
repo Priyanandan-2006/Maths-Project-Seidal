@@ -1,13 +1,109 @@
 """
-Gauss-Seidel Solver Web Application
-Integrates the original Python solver with the HTML interface
-"""
-
+ Gauss-Seidel Solver Web Application
+ Integrates the original Python solver with the HTML interface
+ """
 from flask import Flask, render_template_string, request, jsonify
 import re
+import json
+import sqlite3
+from datetime import datetime
 from math import isclose
 
 app = Flask(__name__)
+
+
+DB_PATH = 'solver_history.db'
+
+
+def init_db() -> None:
+    """Create local SQLite table for solve history."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS solve_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                tol REAL NOT NULL,
+                max_iter INTEGER NOT NULL,
+                variables TEXT NOT NULL,
+                input_payload TEXT NOT NULL,
+                converged INTEGER NOT NULL,
+                iter_count INTEGER NOT NULL,
+                solution TEXT NOT NULL,
+                diagnostics TEXT NOT NULL
+            )
+            '''
+        )
+        conn.commit()
+
+
+def save_history_entry(entry: dict, result: dict) -> None:
+    """Persist one successful solve call into the history table."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            '''
+            INSERT INTO solve_history (
+                created_at, mode, tol, max_iter, variables, input_payload,
+                converged, iter_count, solution, diagnostics
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+                entry['mode'],
+                entry['tol'],
+                entry['maxIter'],
+                json.dumps(entry['variables']),
+                json.dumps(entry['input']),
+                int(result['converged']),
+                int(result['iterCount']),
+                json.dumps(result['solution']),
+                json.dumps(result.get('diagnostics', {})),
+            ),
+        )
+        conn.commit()
+
+
+def fetch_history(limit: int = 20) -> list:
+    """Return latest solve history entries."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            '''
+            SELECT id, created_at, mode, tol, max_iter, variables, input_payload,
+                   converged, iter_count, solution, diagnostics
+            FROM solve_history
+            ORDER BY id DESC
+            LIMIT ?
+            ''',
+            (limit,),
+        ).fetchall()
+
+    items = []
+    for row in rows:
+        items.append({
+            'id': row['id'],
+            'createdAt': row['created_at'],
+            'mode': row['mode'],
+            'tol': row['tol'],
+            'maxIter': row['max_iter'],
+            'variables': json.loads(row['variables']),
+            'input': json.loads(row['input_payload']),
+            'converged': bool(row['converged']),
+            'iterCount': row['iter_count'],
+            'solution': json.loads(row['solution']),
+            'diagnostics': json.loads(row['diagnostics']),
+        })
+    return items
+
+
+def clear_history() -> None:
+    """Delete all history entries."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute('DELETE FROM solve_history')
+        conn.commit()
+
+init_db()
 
 # ────────────────────────────────────────────────
 # Parse single equation → coefficients + constant
@@ -34,114 +130,119 @@ def parse_equation(eq: str, var_to_idx: dict) -> tuple:
     while i < len(left):
         m = re.match(pattern, left[i:])
         if not m:
-            if left[i].isspace():
-                i += 1
-                continue
-            raise ValueError(f"Cannot parse at position {i}: '{left[i:]}'")
+            raise ValueError(f"Invalid syntax near: {left[i:]}")
 
-        sign_str, num_str, var1, sign2, var2 = m.groups()
-        sign = sign_str or sign2 or implicit_sign
-        var = var1 or var2
-        num = num_str.strip()
+        groups = m.groups()
+        # groups = (sign1, coeff_num, var1, sign2, var2)
+        sign1, coeff_str, var1, sign2, var2 = groups
 
-        if var not in var_to_idx:
-            raise ValueError(f"Unknown variable '{var}'")
+        if var1:  # case: sign + coeff + var
+            s = sign1 if sign1 else implicit_sign
+            c_str = coeff_str if coeff_str else "1"
+            c = float(c_str) if s == "+" else -float(c_str)
+            if var1 not in var_to_idx:
+                raise ValueError(f"Unknown variable '{var1}'")
+            coeffs[var_to_idx[var1]] += c
 
-        idx = var_to_idx[var]
+        elif var2:  # case: sign + var (no coeff digit)
+            s = sign2
+            c = 1.0 if s == "+" else -1.0
+            if var2 not in var_to_idx:
+                raise ValueError(f"Unknown variable '{var2}'")
+            coeffs[var_to_idx[var2]] += c
 
-        if num == "" or num == ".":
-            coeff = 1.0
-        else:
-            try:
-                coeff = float(num)
-            except ValueError:
-                raise ValueError(f"Invalid coefficient '{num}' before {var}")
+        implicit_sign = "+"  # once we've seen a sign/term, next is explicit
+        i += len(m.group(0))
 
-        if sign == "-":
-            coeff = -coeff
-
-        coeffs[idx] += coeff
-        i += m.end()
-        implicit_sign = "+"  # after first term
-
-    return coeffs, rhs
+    return (coeffs, rhs)
 
 
 # ────────────────────────────────────────────────
-# Reorder rows → largest possible diagonal elements
+# Diagonal dominance check & row swapping
 # ────────────────────────────────────────────────
 def prepare_matrix(A: list, b: list) -> tuple:
-    """Prepare matrix by reordering rows for numerical stability"""
+    """
+    Attempt to rearrange rows for diagonal dominance.
+    Returns the possibly swapped (A, b).
+    """
     n = len(A)
-    A = [row[:] for row in A]  # deep copy
-    b = b[:]
+    used_rows = [False] * n
+    new_A = []
+    new_b = []
 
-    for i in range(n):
-        # Find row with largest abs value in column i (from current row down)
-        max_row = i
-        max_val = abs(A[i][i])
+    for col in range(n):
+        best_row = -1
+        best_ratio = -1.0
 
-        for k in range(i + 1, n):
-            if abs(A[k][i]) > max_val:
-                max_val = abs(A[k][i])
-                max_row = k
+        for row in range(n):
+            if used_rows[row]:
+                continue
+            diag_val = abs(A[row][col])
+            off_sum = sum(abs(A[row][j]) for j in range(n) if j != col)
+            if diag_val > 1e-12:
+                ratio = diag_val / (off_sum + 1e-12)
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_row = row
 
-        # Swap rows
-        if max_row != i:
-            A[i], A[max_row] = A[max_row], A[i]
-            b[i], b[max_row] = b[max_row], b[i]
+        if best_row == -1:
+            # No suitable row found for this column
+            # Just pick the first unused row
+            for row in range(n):
+                if not used_rows[row]:
+                    best_row = row
+                    break
 
-        # Final safety check
-        if isclose(A[i][i], 0, abs_tol=1e-12):
-            raise ValueError(
-                f"Near-zero pivot on diagonal at position {i} after reordering. "
-                "System may be singular or requires different method."
-            )
+        used_rows[best_row] = True
+        new_A.append(A[best_row])
+        new_b.append(b[best_row])
 
-    return A, b
+    return (new_A, new_b)
 
 
 # ────────────────────────────────────────────────
-# Gauss-Seidel iteration
+# Gauss-Seidel Solver
 # ────────────────────────────────────────────────
 def gauss_seidel(
     A: list,
     b: list,
     variables: list,
     tol: float = 1e-4,
-    max_iter: int = 1000,
+    max_iter: int = 1000
 ) -> dict:
     """
-    Solve system using Gauss-Seidel iteration
-    Returns dict with solution and iteration details
+    Solve Ax = b using Gauss-Seidel iteration.
+    
+    Args:
+        A: coefficient matrix (n x n)
+        b: constants vector (n)
+        variables: list of variable names
+        tol: convergence tolerance
+        max_iter: maximum iterations
+    
+    Returns:
+        dict with converged, iterations, solution, iterCount
     """
     n = len(A)
     x = [0.0] * n
-    iteration = 0
     iterations_log = []
 
-    while iteration < max_iter:
-        iteration += 1
-        x_new = x.copy()
-        max_delta = 0.0
+    for iteration in range(1, max_iter + 1):
+        x_old = x[:]
         details = []
-
+        
         for i in range(n):
-            s = sum(A[i][j] * x_new[j] for j in range(n) if j != i)
-            if abs(A[i][i]) < 1e-12:
-                raise ValueError(f"Zero division prevented at variable {variables[i]}")
-
-            x_new[i] = (b[i] - s) / A[i][i]
-            delta = abs(x_new[i] - x[i])
-            max_delta = max(max_delta, delta)
-
+            sigma = sum(A[i][j] * x[j] for j in range(n) if j != i)
+            x[i] = (b[i] - sigma) / A[i][i]
+            
+            delta = abs(x[i] - x_old[i])
             details.append({
                 'variable': variables[i],
-                'value': x_new[i],
+                'value': x[i],
                 'delta': delta
             })
 
-        x = x_new
+        max_delta = max(d['delta'] for d in details)
 
         # Store iteration details (first 10 or every 20th)
         if iteration <= 10 or iteration % 20 == 0:
@@ -167,6 +268,64 @@ def gauss_seidel(
     }
 
 
+def analyze_system(A: list, b: list, x: list) -> dict:
+    """Return diagnostics that explain numerical stability and solution quality."""
+    n = len(A)
+    row_metrics = []
+    min_margin = float('inf')
+    strict_rows = 0
+    weak_rows = 0
+
+    for i in range(n):
+        diag = abs(A[i][i])
+        off_diag = sum(abs(A[i][j]) for j in range(n) if j != i)
+        margin = diag - off_diag
+        ratio = (diag / off_diag) if off_diag > 0 else float('inf')
+        min_margin = min(min_margin, margin)
+
+        if diag > off_diag:
+            strict_rows += 1
+            status = 'strict'
+        elif isclose(diag, off_diag, rel_tol=1e-12, abs_tol=1e-12):
+            weak_rows += 1
+            status = 'weak'
+        else:
+            status = 'not_dominant'
+
+        row_metrics.append({
+            'row': i + 1,
+            'diagAbs': diag,
+            'offDiagAbs': off_diag,
+            'margin': margin,
+            'ratio': ratio,
+            'status': status,
+        })
+
+    residual_vector = []
+    for i in range(n):
+        lhs = sum(A[i][j] * x[j] for j in range(n))
+        residual_vector.append(lhs - b[i])
+
+    inf_norm = max(abs(r) for r in residual_vector) if residual_vector else 0.0
+
+    if strict_rows == n:
+        stability = 'excellent'
+    elif strict_rows + weak_rows == n:
+        stability = 'fair'
+    else:
+        stability = 'risky'
+
+    return {
+        'rowMetrics': row_metrics,
+        'strictDominantRows': strict_rows,
+        'weakDominantRows': weak_rows,
+        'minimumMargin': min_margin,
+        'residualVector': residual_vector,
+        'residualInfinityNorm': inf_norm,
+        'stability': stability,
+    }
+
+
 # ────────────────────────────────────────────────
 # Web Routes
 # ────────────────────────────────────────────────
@@ -187,7 +346,9 @@ HTML_TEMPLATE = '''
 
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f093fb 100%);
+            background: radial-gradient(circle at top left, #7c3aed 0%, transparent 45%),
+                        radial-gradient(circle at 85% 15%, #0ea5e9 0%, transparent 35%),
+                        linear-gradient(135deg, #1e1b4b 0%, #312e81 45%, #4c1d95 100%);
             min-height: 100vh;
             padding: 40px 20px;
             display: flex;
@@ -199,28 +360,27 @@ HTML_TEMPLATE = '''
         body::before {
             content: '';
             position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: 
-                radial-gradient(circle at 20% 50%, rgba(120, 119, 198, 0.3) 0%, transparent 50%),
-                radial-gradient(circle at 80% 80%, rgba(252, 163, 17, 0.3) 0%, transparent 50%),
-                radial-gradient(circle at 40% 20%, rgba(59, 130, 246, 0.3) 0%, transparent 50%);
+            inset: 0;
+            background-image: linear-gradient(rgba(255,255,255,0.05) 1px, transparent 1px),
+                              linear-gradient(90deg, rgba(255,255,255,0.05) 1px, transparent 1px);
+            background-size: 30px 30px;
+            mask-image: radial-gradient(circle at center, black, transparent 85%);
             pointer-events: none;
         }
 
         .container {
-            background: rgba(255, 255, 255, 0.98);
-            backdrop-filter: blur(10px);
-            border-radius: 16px;
-            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1), 0 2px 8px rgba(0, 0, 0, 0.05);
-            max-width: 1000px;
+            background: linear-gradient(145deg, rgba(255,255,255,0.9), rgba(224,231,255,0.85));
+            backdrop-filter: blur(12px);
+            border-radius: 22px;
+            box-shadow: 0 30px 70px rgba(15, 23, 42, 0.45), 0 0 0 1px rgba(129,140,248,0.35), 0 0 40px rgba(56,189,248,0.2);
+            max-width: 1100px;
             width: 100%;
             padding: 48px;
             animation: slideIn 0.4s ease-out;
             position: relative;
-            border: 1px solid rgba(255, 255, 255, 0.5);
+            z-index: 2;
+            border: 1px solid rgba(255, 255, 255, 0.8);
+            overflow: hidden;
         }
 
         @keyframes slideIn {
@@ -235,37 +395,68 @@ HTML_TEMPLATE = '''
         }
 
         .header {
-            margin-bottom: 40px;
-            border-bottom: 2px solid transparent;
-            border-image: linear-gradient(90deg, #667eea, #764ba2, #f093fb);
-            border-image-slice: 1;
-            padding-bottom: 24px;
+            margin-bottom: 28px;
+            padding: 28px;
+            border-radius: 18px;
+            background: linear-gradient(135deg, #312e81 0%, #5b21b6 52%, #0284c7 100%);
+            box-shadow: 0 12px 28px rgba(49, 46, 129, 0.35);
+            color: white;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .header::after {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: radial-gradient(circle at 80% 20%, rgba(255,255,255,0.25), transparent 50%);
+            pointer-events: none;
         }
 
         h1 {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f093fb 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-            font-size: 32px;
-            font-weight: 700;
+            color: #ffffff;
+            font-size: 34px;
+            font-weight: 800;
             margin-bottom: 8px;
-            letter-spacing: -0.5px;
+            letter-spacing: -0.6px;
+            text-shadow: 0 4px 20px rgba(15, 23, 42, 0.25);
         }
 
         .subtitle {
-            color: #6b7280;
+            color: rgba(255,255,255,0.92);
             font-size: 14px;
-            font-weight: 400;
+            font-weight: 500;
+            max-width: 640px;
+        }
+
+        .hero-tags {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 16px;
+            position: relative;
+            z-index: 1;
+        }
+
+        .hero-tag {
+            border: 1px solid rgba(255,255,255,0.45);
+            color: white;
+            background: rgba(255,255,255,0.14);
+            border-radius: 999px;
+            padding: 6px 12px;
+            font-size: 12px;
+            font-weight: 700;
+            backdrop-filter: blur(3px);
+            letter-spacing: 0.2px;
         }
 
         .mode-selector {
-            display: inline-flex;
-            background: linear-gradient(135deg, #f3f4f6 0%, #e5e7eb 100%);
-            border-radius: 10px;
-            padding: 4px;
-            margin-bottom: 32px;
-            box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.06);
+            background: #eef2ff;
+            border-radius: 12px;
+            padding: 5px;
+            margin-bottom: 26px;
+            box-shadow: inset 0 2px 6px rgba(79, 70, 229, 0.15);
+            border: 1px solid #c7d2fe;
         }
 
         .mode-btn {
@@ -294,29 +485,22 @@ HTML_TEMPLATE = '''
         }
 
         .input-section {
-            background: linear-gradient(135deg, #fafbfc 0%, #f8f9fa 100%);
-            border: 2px solid transparent;
-            background-clip: padding-box;
+            background: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
+            border: 1px solid #dbeafe;
             position: relative;
             padding: 28px;
-            border-radius: 12px;
+            border-radius: 14px;
             margin-bottom: 24px;
             animation: expandIn 0.3s ease-out;
+            box-shadow: 0 10px 24px rgba(37, 99, 235, 0.08);
         }
 
         .input-section::before {
             content: '';
             position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            border-radius: 12px;
-            padding: 2px;
-            background: linear-gradient(135deg, #667eea, #764ba2, #f093fb);
-            -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
-            -webkit-mask-composite: xor;
-            mask-composite: exclude;
+            inset: 0;
+            border-radius: 14px;
+            border: 1px solid rgba(99, 102, 241, 0.15);
             pointer-events: none;
         }
 
@@ -342,97 +526,74 @@ HTML_TEMPLATE = '''
         label {
             display: block;
             margin-bottom: 10px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
-            font-size: 13px;
             font-weight: 700;
-            text-transform: uppercase;
-            letter-spacing: 0.8px;
+            color: #1f2937;
+            font-size: 14px;
+            letter-spacing: 0.3px;
         }
 
         input[type="number"],
         input[type="text"] {
             width: 100%;
-            padding: 11px 14px;
+            padding: 12px 16px;
             border: 2px solid #e5e7eb;
             border-radius: 8px;
             font-size: 14px;
-            font-family: 'SF Mono', Monaco, Consolas, monospace;
-            transition: all 0.3s ease;
+            transition: all 0.2s ease;
             background: white;
-            color: #111827;
+            font-family: inherit;
         }
 
-        input:focus {
+        input[type="number"]:focus,
+        input[type="text"]:focus {
             outline: none;
             border-color: #667eea;
-            box-shadow: 0 0 0 4px rgba(102, 126, 234, 0.15), 0 4px 12px rgba(102, 126, 234, 0.2);
-            transform: translateY(-1px);
-        }
-
-        input:hover:not(:focus) {
-            border-color: #d1d5db;
-        }
-
-        input::placeholder {
-            color: #9ca3af;
-        }
-
-        .matrix-input {
-            display: grid;
-            gap: 8px;
-            margin-top: 12px;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
         }
 
         .matrix-row {
             display: flex;
-            gap: 8px;
-            animation: slideInRow 0.25s ease-out backwards;
-        }
-
-        @keyframes slideInRow {
-            from {
-                opacity: 0;
-                transform: translateX(-15px);
-            }
-            to {
-                opacity: 1;
-                transform: translateX(0);
-            }
+            gap: 12px;
+            margin-bottom: 12px;
+            align-items: center;
         }
 
         .matrix-row input {
             flex: 1;
-            text-align: center;
+            min-width: 0;
         }
 
-        .equation-input {
+        .matrix-label {
+            font-weight: 600;
+            color: #667eea;
+            min-width: 30px;
+            font-size: 13px;
+        }
+
+        .equation-input-wrapper {
             display: flex;
-            align-items: center;
             gap: 12px;
             margin-bottom: 12px;
-            animation: slideInRow 0.25s ease-out backwards;
-        }
-
-        .equation-input input {
-            flex: 1;
+            align-items: center;
         }
 
         .equation-number {
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
-            width: 36px;
-            height: 36px;
+            width: 32px;
+            height: 32px;
             border-radius: 8px;
             display: flex;
             align-items: center;
             justify-content: center;
             font-weight: 700;
-            font-size: 14px;
+            font-size: 13px;
             flex-shrink: 0;
-            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
+            box-shadow: 0 2px 8px rgba(102, 126, 234, 0.3);
+        }
+
+        .equation-input-wrapper input {
+            flex: 1;
         }
 
         .solve-btn {
@@ -454,17 +615,92 @@ HTML_TEMPLATE = '''
         .solve-btn::before {
             content: '';
             position: absolute;
-            top: 0;
-            left: -100%;
-            width: 100%;
-            height: 100%;
-            background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.3), transparent);
-            transition: left 0.5s ease;
+            top: 50%;
+            left: 50%;
+            width: 0;
+            height: 0;
+            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.3);
+            transform: translate(-50%, -50%);
+            transition: width 0.6s, height 0.6s;
         }
 
-        .solve-btn:hover:not(:disabled)::before {
-            left: 100%;
+        .solve-btn:hover::before {
+            width: 300px;
+            height: 300px;
         }
+
+        .solve-btn span {
+            position: relative;
+            z-index: 1;
+        }
+
+        .loading {
+            display: inline-block;
+            width: 14px;
+            height: 14px;
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            border-top-color: white;
+            border-radius: 50%;
+            animation: spin 0.6s linear infinite;
+            margin-right: 8px;
+            vertical-align: middle;
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg);
+            }
+        }
+
+        .solve-btn::after {
+            content: '→';
+            position: absolute;
+            right: 24px;
+            top: 50%;
+            transform: translateY(-50%);
+            font-size: 20px;
+            opacity: 0;
+            transition: all 0.3s ease;
+        }
+
+        .solve-btn:hover::after {
+            opacity: 1;
+            right: 20px;
+        }
+
+        .solve-btn:not(:disabled):hover::after {
+            animation: slideArrow 0.6s ease-in-out infinite;
+        }
+
+        @keyframes slideArrow {
+            0%, 100% {
+                transform: translateY(-50%) translateX(0);
+            }
+            50% {
+                transform: translateY(-50%) translateX(4px);
+            }
+        }
+
+        .solve-btn span {
+            transition: transform 0.3s ease;
+        }
+
+        .solve-btn:hover span {
+            transform: translateX(-8px);
+        }
+
+        .solve-btn .loading {
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            transform: translate(-50%, -50%);
+            margin: 0;
+        }
+
+        .solve-btn:hover .loading {
+            left: calc(50% - 10px);
+}
 
         .solve-btn:hover:not(:disabled) {
             background: linear-gradient(135deg, #764ba2 0%, #667eea 100%);
@@ -488,14 +724,14 @@ HTML_TEMPLATE = '''
         }
 
         .results-header {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, #3730a3 0%, #7c3aed 60%, #0284c7 100%);
             color: white;
             padding: 18px 24px;
-            border-radius: 10px 10px 0 0;
+            border-radius: 12px 12px 0 0;
             font-size: 16px;
             font-weight: 700;
             letter-spacing: 0.5px;
-            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3);
+            box-shadow: 0 8px 20px rgba(67, 56, 202, 0.35);
         }
 
         .results-content {
@@ -527,154 +763,139 @@ HTML_TEMPLATE = '''
         }
 
         .iteration-block {
-            background: linear-gradient(135deg, #fafbfc 0%, #f8f9fa 100%);
-            border: 2px solid transparent;
-            border-left: 4px solid;
-            border-image: linear-gradient(180deg, #667eea, #764ba2) 1;
+            background: linear-gradient(135deg, #f9fafb 0%, #f3f4f6 100%);
+            border-left: 4px solid #667eea;
             padding: 20px;
             margin-bottom: 16px;
-            border-radius: 10px;
-            animation: slideInRow 0.25s ease-out;
-            box-shadow: 0 2px 8px rgba(102, 126, 234, 0.08);
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+
+        .iteration-block:hover {
+            transform: translateX(4px);
+            box-shadow: 0 4px 16px rgba(102, 126, 234, 0.15);
         }
 
         .iteration-header {
             font-weight: 700;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
+            color: #667eea;
             margin-bottom: 16px;
             font-size: 15px;
-            padding-bottom: 12px;
-            border-bottom: 2px solid #f3f4f6;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
         }
 
         .variable-value {
             display: flex;
             justify-content: space-between;
-            padding: 12px 0;
-            border-bottom: 1px solid #f3f4f6;
-            font-family: 'SF Mono', Monaco, Consolas, monospace;
-            font-size: 13px;
+            align-items: center;
+            padding: 10px 0;
+            border-bottom: 1px solid #e5e7eb;
+            font-size: 14px;
         }
 
-        .variable-value:last-child {
+        .variable-value:last-of-type {
             border-bottom: none;
         }
 
         .variable-name {
             font-weight: 700;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            background-clip: text;
+            color: #1f2937;
+            font-size: 15px;
         }
 
         .variable-number {
-            color: #764ba2;
+            font-family: 'SF Mono', Monaco, Consolas, monospace;
+            color: #4b5563;
             font-weight: 600;
         }
 
         .delta {
             color: #6b7280;
             font-size: 12px;
-            background: #f3f4f6;
-            padding: 2px 8px;
-            border-radius: 4px;
-        }
-
-        .max-change {
-            margin-top: 16px;
-            padding-top: 16px;
-            border-top: 2px solid #f3f4f6;
-            color: #374151;
-            font-size: 13px;
             font-family: 'SF Mono', Monaco, Consolas, monospace;
+            background: #f3f4f6;
+            padding: 4px 10px;
+            border-radius: 6px;
             font-weight: 600;
         }
 
-        .final-solution {
-            background: linear-gradient(135deg, #10b981 0%, #059669 50%, #047857 100%);
-            color: white;
-            padding: 28px;
-            border-radius: 12px;
-            margin-top: 16px;
-            box-shadow: 0 8px 24px rgba(16, 185, 129, 0.4);
-            position: relative;
-            overflow: hidden;
+        .max-change {
+            margin-top: 14px;
+            padding-top: 14px;
+            border-top: 2px dashed #d1d5db;
+            color: #6b7280;
+            font-size: 13px;
+            font-weight: 600;
+            font-family: 'SF Mono', Monaco, Consolas, monospace;
         }
 
-        .final-solution::before {
-            content: '';
-            position: absolute;
-            top: -50%;
-            right: -50%;
-            width: 200%;
-            height: 200%;
-            background: radial-gradient(circle, rgba(255, 255, 255, 0.1) 0%, transparent 70%);
-            pointer-events: none;
+        .final-solution {
+            background: linear-gradient(135deg, #ecfdf5 0%, #d1fae5 100%);
+            border: 2px solid #6ee7b7;
+            padding: 24px;
+            border-radius: 12px;
+            margin-top: 24px;
+            box-shadow: 0 4px 16px rgba(52, 211, 153, 0.2);
         }
 
         .final-solution h3 {
-            margin-bottom: 20px;
+            color: #047857;
+            margin-bottom: 18px;
             font-size: 18px;
-            font-weight: 700;
-            letter-spacing: 0.5px;
-            position: relative;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
         }
 
         .solution-item {
-            padding: 14px 0;
-            font-family: 'SF Mono', Monaco, Consolas, monospace;
-            font-size: 16px;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.2);
             display: flex;
             justify-content: space-between;
-            position: relative;
+            align-items: center;
+            padding: 14px 0;
+            border-bottom: 1px solid #a7f3d0;
+            font-size: 15px;
         }
 
         .solution-item:last-child {
             border-bottom: none;
         }
 
+        .solution-item span:first-child {
+            font-weight: 700;
+            color: #065f46;
+            font-size: 16px;
+        }
+
+        .solution-item span:last-child {
+            font-family: 'SF Mono', Monaco, Consolas, monospace;
+            color: #047857;
+            font-size: 18px;
+            font-weight: 700;
+        }
+
         .error-message {
-            background: linear-gradient(135deg, #fef2f2 0%, #fee2e2 100%);
-            border: 2px solid #fca5a5;
+            background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%);
+            border: 2px solid #f87171;
             color: #991b1b;
-            padding: 16px;
-            border-radius: 10px;
-            margin-top: 16px;
+            padding: 20px;
+            border-radius: 12px;
+            margin-top: 24px;
             font-size: 14px;
-            font-weight: 600;
-            box-shadow: 0 4px 12px rgba(239, 68, 68, 0.15);
+            box-shadow: 0 4px 16px rgba(239, 68, 68, 0.2);
         }
 
         .error-message strong {
-            font-weight: 700;
-            color: #7f1d1d;
-        }
-
-        .loading {
-            display: inline-block;
-            width: 16px;
-            height: 16px;
-            border: 2px solid rgba(255, 255, 255, 0.3);
-            border-radius: 50%;
-            border-top-color: white;
-            animation: spin 0.8s linear infinite;
-            margin-right: 8px;
-            vertical-align: middle;
-        }
-
-        @keyframes spin {
-            to { transform: rotate(360deg); }
+            display: block;
+            margin-bottom: 8px;
+            font-size: 15px;
         }
 
         .info-box {
-            background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%);
-            border: 2px solid #93c5fd;
-            padding: 14px;
+            background: linear-gradient(135deg, #dbeafe 0%, #bfdbfe 100%);
+            border: 1px solid #93c5fd;
+            padding: 16px;
             border-radius: 8px;
             margin-top: 16px;
             color: #1e40af;
@@ -700,6 +921,218 @@ HTML_TEMPLATE = '''
             box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
         }
 
+
+
+        .action-row {
+            display: grid;
+            grid-template-columns: 1fr 180px 180px;
+            gap: 10px;
+            margin-top: 6px;
+        }
+
+        .secondary-btn {
+            padding: 14px;
+            border: none;
+            border-radius: 10px;
+            font-size: 14px;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            color: #1f2937;
+            background: linear-gradient(135deg, #e5e7eb 0%, #d1d5db 100%);
+        }
+
+        .secondary-btn:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 6px 16px rgba(17, 24, 39, 0.15);
+        }
+
+        .clear-btn {
+            background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%);
+            color: #7f1d1d;
+        }
+
+        .history-panel {
+            margin-top: 20px;
+            background: linear-gradient(135deg, #eef2ff 0%, #f0f9ff 100%);
+            border: 1px solid #bfdbfe;
+            border-radius: 14px;
+            padding: 18px;
+            box-shadow: 0 8px 24px rgba(14, 116, 144, 0.12);
+        }
+
+        .history-item {
+            border: 1px solid #c7d2fe;
+            background: white;
+            border-radius: 12px;
+            padding: 14px;
+            margin-bottom: 10px;
+            font-size: 13px;
+            color: #1f2937;
+            box-shadow: 0 4px 14px rgba(99, 102, 241, 0.08);
+        }
+
+        .history-item:last-child {
+            margin-bottom: 0;
+        }
+
+        .history-title {
+            font-weight: 800;
+            color: #312e81;
+            margin-bottom: 10px;
+            font-size: 15px;
+            letter-spacing: 0.3px;
+        }
+
+        .history-meta {
+            font-family: 'SF Mono', Monaco, Consolas, monospace;
+            color: #374151;
+            margin-bottom: 6px;
+        }
+
+        .history-status {
+            display: inline-block;
+            margin-top: 6px;
+            padding: 4px 10px;
+            border-radius: 999px;
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.2px;
+            text-transform: uppercase;
+        }
+
+        .history-status.ok {
+            background: #dcfce7;
+            color: #166534;
+        }
+
+        .history-status.warn {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+
+        .diagnostics-panel {
+            margin-top: 16px;
+            background: linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%);
+            border: 2px solid #fcd34d;
+            border-radius: 12px;
+            padding: 20px;
+        }
+
+        .diagnostics-panel h3 {
+            color: #92400e;
+            margin-bottom: 10px;
+            font-size: 16px;
+        }
+
+        .diagnostics-panel p {
+            color: #78350f;
+            font-size: 13px;
+            margin-bottom: 8px;
+        }
+
+        .diagnostics-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+            font-family: 'SF Mono', Monaco, Consolas, monospace;
+            font-size: 12px;
+            background: white;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+
+        .diagnostics-table th,
+        .diagnostics-table td {
+            border: 1px solid #fde68a;
+            padding: 8px;
+            text-align: center;
+        }
+
+        .diagnostics-table th {
+            background: #fef3c7;
+            color: #78350f;
+            font-weight: 700;
+        }
+
+        .status-pill {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 999px;
+            font-size: 11px;
+            font-weight: 700;
+            text-transform: uppercase;
+        }
+
+        .status-strict {
+            background: #dcfce7;
+            color: #166534;
+        }
+
+        .status-weak {
+            background: #fef3c7;
+            color: #92400e;
+        }
+
+        .status-not_dominant {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+
+        .math-sky {
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            z-index: 0;
+            overflow: hidden;
+        }
+
+        .math-symbol {
+            position: absolute;
+            color: rgba(255,255,255,0.8);
+            font-weight: 800;
+            text-shadow: 0 0 16px rgba(147,197,253,0.9);
+            animation: floatMath var(--dur, 16s) linear infinite;
+            animation-delay: var(--delay, 0s);
+            transform: translateY(120vh) rotate(0deg);
+            user-select: none;
+        }
+
+        @keyframes floatMath {
+            0% {
+                transform: translateY(115vh) translateX(0) rotate(0deg) scale(0.9);
+                opacity: 0;
+            }
+            10% { opacity: 0.85; }
+            50% {
+                transform: translateY(50vh) translateX(20px) rotate(180deg) scale(1.05);
+            }
+            100% {
+                transform: translateY(-20vh) translateX(-14px) rotate(360deg) scale(0.9);
+                opacity: 0;
+            }
+        }
+
+        .header::before {
+            content: '🤖 solving equations in hyperspace...';
+            position: absolute;
+            right: 18px;
+            bottom: 12px;
+            font-size: 12px;
+            font-weight: 700;
+            color: rgba(255,255,255,0.9);
+            background: rgba(15,23,42,0.28);
+            border: 1px solid rgba(255,255,255,0.35);
+            border-radius: 999px;
+            padding: 6px 12px;
+            animation: pulseTag 1.8s ease-in-out infinite;
+        }
+
+        @keyframes pulseTag {
+            0%, 100% { transform: scale(1); opacity: 0.8; }
+            50% { transform: scale(1.04); opacity: 1; }
+        }
+
         @media (max-width: 768px) {
             body {
                 padding: 20px 16px;
@@ -720,14 +1153,40 @@ HTML_TEMPLATE = '''
             .mode-btn {
                 flex: 1;
             }
+
+            .action-row {
+                grid-template-columns: 1fr;
+            }
+
+            .header::before {
+                position: static;
+                display: inline-block;
+                margin-top: 10px;
+            }
         }
     </style>
 </head>
 <body>
+    <div class="math-sky" aria-hidden="true">
+        <span class="math-symbol" style="left:6%;font-size:32px;--dur:18s;--delay:0s">∑</span>
+        <span class="math-symbol" style="left:14%;font-size:24px;--dur:14s;--delay:2s">π</span>
+        <span class="math-symbol" style="left:22%;font-size:28px;--dur:17s;--delay:4s">√</span>
+        <span class="math-symbol" style="left:34%;font-size:26px;--dur:20s;--delay:1s">∞</span>
+        <span class="math-symbol" style="left:46%;font-size:30px;--dur:15s;--delay:3s">x²</span>
+        <span class="math-symbol" style="left:58%;font-size:22px;--dur:16s;--delay:5s">Δ</span>
+        <span class="math-symbol" style="left:68%;font-size:30px;--dur:19s;--delay:2.5s">∫</span>
+        <span class="math-symbol" style="left:78%;font-size:24px;--dur:13s;--delay:6s">≈</span>
+        <span class="math-symbol" style="left:88%;font-size:28px;--dur:21s;--delay:1.5s">θ</span>
+    </div>
     <div class="container">
         <div class="header">
             <h1>Gauss-Seidel Iterative Solver</h1>
-            <p class="subtitle">Numerical solution for systems of linear equations</p>
+            <p class="subtitle">Numerical solution for systems of linear equations with live diagnostics and saved history.</p>
+            <div class="hero-tags">
+                <span class="hero-tag">Fast Iteration Tracking</span>
+                <span class="hero-tag">Residual Diagnostics</span>
+                <span class="hero-tag">Persistent History</span>
+            </div>
         </div>
 
         <div class="mode-selector">
@@ -772,11 +1231,27 @@ HTML_TEMPLATE = '''
             </div>
         </div>
 
-        <button class="solve-btn" onclick="solve()">
-            <span id="solveText">Compute Solution</span>
-        </button>
+        <div class="input-section" style="margin-top: 0;">
+            <div class="form-group">
+                <label>Tolerance:</label>
+                <input type="number" id="tolerance" step="any" min="0.0000001" value="0.0001">
+            </div>
+            <div class="form-group">
+                <label>Maximum Iterations:</label>
+                <input type="number" id="maxIterations" min="1" max="5000" value="1000">
+            </div>
+        </div>
+
+        <div class="action-row">
+            <button class="solve-btn" onclick="solve()">
+                <span id="solveText">Compute Solution</span>
+            </button>
+            <button class="secondary-btn" onclick="toggleHistory()">View History</button>
+            <button class="secondary-btn clear-btn" onclick="clearHistoryRecords()">Clear History</button>
+        </div>
 
         <div id="results" style="display: none;"></div>
+        <div id="historyPanel" class="history-panel" style="display: none;"></div>
     </div>
 
     <script>
@@ -804,39 +1279,53 @@ HTML_TEMPLATE = '''
             matrixInputs.innerHTML = '';
             constantInputs.innerHTML = '';
 
-            const matrixContainer = document.createElement('div');
-            matrixContainer.className = 'matrix-input';
+            // Default values for 3x3 system
+            const defaultA = [
+                [10, -1, 2],
+                [-1, 11, -1],
+                [2, -1, 10]
+            ];
+            const defaultB = [6, 25, -11];
 
             for (let i = 0; i < n; i++) {
                 const row = document.createElement('div');
                 row.className = 'matrix-row';
-                row.style.animationDelay = `${i * 0.05}s`;
+
+                const label = document.createElement('span');
+                label.className = 'matrix-label';
+                label.textContent = `Row ${i + 1}:`;
+                row.appendChild(label);
 
                 for (let j = 0; j < n; j++) {
                     const input = document.createElement('input');
                     input.type = 'number';
                     input.step = 'any';
-                    input.placeholder = `a${i+1}${j+1}`;
                     input.id = `a${i}_${j}`;
-                    input.value = i === j ? '10' : '1';
+                    input.placeholder = `a${i+1}${j+1}`;
+                    input.value = (i < 3 && j < 3) ? defaultA[i][j] : (i === j ? 1 : 0);
                     row.appendChild(input);
                 }
-                matrixContainer.appendChild(row);
-            }
-            matrixInputs.appendChild(matrixContainer);
 
-            const constantRow = document.createElement('div');
-            constantRow.className = 'matrix-row';
-            for (let i = 0; i < n; i++) {
-                const input = document.createElement('input');
-                input.type = 'number';
-                input.step = 'any';
-                input.placeholder = `b${i+1}`;
-                input.id = `b${i}`;
-                input.value = '10';
-                constantRow.appendChild(input);
+                matrixInputs.appendChild(row);
+
+                const constRow = document.createElement('div');
+                constRow.className = 'matrix-row';
+
+                const constLabel = document.createElement('span');
+                constLabel.className = 'matrix-label';
+                constLabel.textContent = `b${i + 1}:`;
+                constRow.appendChild(constLabel);
+
+                const constInput = document.createElement('input');
+                constInput.type = 'number';
+                constInput.step = 'any';
+                constInput.id = `b${i}`;
+                constInput.placeholder = `b${i+1}`;
+                constInput.value = (i < 3) ? defaultB[i] : 0;
+                constRow.appendChild(constInput);
+
+                constantInputs.appendChild(constRow);
             }
-            constantInputs.appendChild(constantRow);
         }
 
         function generateEquationInputs() {
@@ -845,15 +1334,14 @@ HTML_TEMPLATE = '''
             container.innerHTML = '';
 
             const examples = [
-                '10x + y + z = 12',
-                'x + 10y + z = 12',
-                'x + y + 10z = 12'
+                '10x - y + 2z = 6',
+                '-x + 11y - z = 25',
+                '2x - y + 10z = -11'
             ];
 
             for (let i = 0; i < n; i++) {
                 const div = document.createElement('div');
-                div.className = 'equation-input';
-                div.style.animationDelay = `${i * 0.05}s`;
+                div.className = 'equation-input-wrapper';
 
                 const number = document.createElement('div');
                 number.className = 'equation-number';
@@ -881,7 +1369,13 @@ HTML_TEMPLATE = '''
             resultsDiv.style.display = 'none';
 
             try {
-                let requestData = { mode: currentMode };
+                const tolerance = parseFloat(document.getElementById('tolerance').value);
+                const maxIterations = parseInt(document.getElementById('maxIterations').value);
+
+                if (isNaN(tolerance) || tolerance <= 0) throw new Error('Tolerance must be a positive number');
+                if (isNaN(maxIterations) || maxIterations < 1) throw new Error('Maximum iterations must be at least 1');
+
+                let requestData = { mode: currentMode, tol: tolerance, maxIter: maxIterations };
 
                 if (currentMode === 'matrix') {
                     const n = parseInt(document.getElementById('matrixSize').value);
@@ -932,6 +1426,7 @@ HTML_TEMPLATE = '''
                 }
 
                 displayResults(result);
+                await loadHistory();
 
             } catch (error) {
                 resultsDiv.innerHTML = `<div class="error-message"><strong>Error:</strong> ${error.message}</div>`;
@@ -939,6 +1434,60 @@ HTML_TEMPLATE = '''
             } finally {
                 solveBtn.disabled = false;
                 solveText.innerHTML = 'Compute Solution';
+            }
+        }
+
+
+        async function loadHistory() {
+            const historyPanel = document.getElementById('historyPanel');
+            const response = await fetch('/history');
+            const payload = await response.json();
+
+            if (payload.error) {
+                historyPanel.innerHTML = `<div class="error-message"><strong>Error:</strong> ${payload.error}</div>`;
+                return;
+            }
+
+            const items = payload.history || [];
+            if (items.length === 0) {
+                historyPanel.innerHTML = '<div class="history-item">No saved calculations yet. Solve a system to build your history.</div>';
+                return;
+            }
+
+            let html = '<div class="history-title">Saved Calculation History</div>';
+            for (const item of items) {
+                const solutionText = item.variables
+                    .map((name, idx) => `${name}=${Number(item.solution[idx]).toFixed(4)}`)
+                    .join(', ');
+
+                html += '<div class="history-item">';
+                html += `<div class="history-meta">#${item.id} • ${item.createdAt}</div>`;
+                html += `<div><strong>Mode:</strong> ${item.mode} | <strong>tol:</strong> ${item.tol} | <strong>maxIter:</strong> ${item.maxIter}</div>`;
+                html += `<div><strong>Status:</strong> ${item.converged ? 'Converged' : 'Not converged'} in ${item.iterCount} iterations</div>`;
+                html += `<span class="history-status ${item.converged ? 'ok' : 'warn'}">${item.converged ? 'stable result' : 'needs tuning'}</span>`;
+                html += `<div><strong>Solution:</strong> ${solutionText}</div>`;
+                if (item.diagnostics && item.diagnostics.residualInfinityNorm !== undefined) {
+                    html += `<div><strong>Residual ||Ax-b||∞:</strong> ${Number(item.diagnostics.residualInfinityNorm).toExponential(3)}</div>`;
+                }
+                html += '</div>';
+            }
+            historyPanel.innerHTML = html;
+        }
+
+        async function toggleHistory() {
+            const historyPanel = document.getElementById('historyPanel');
+            const show = historyPanel.style.display === 'none';
+            historyPanel.style.display = show ? 'block' : 'none';
+            if (show) {
+                await loadHistory();
+            }
+        }
+
+        async function clearHistoryRecords() {
+            await fetch('/history/clear', { method: 'POST' });
+            const historyPanel = document.getElementById('historyPanel');
+            if (historyPanel.style.display !== 'none') {
+                await loadHistory();
             }
         }
 
@@ -965,6 +1514,37 @@ HTML_TEMPLATE = '''
             }
 
             html += '</div>';
+
+            if (result.diagnostics) {
+                const d = result.diagnostics;
+                const stabilityText = {
+                    excellent: 'Excellent stability (strict diagonal dominance in every row).',
+                    fair: 'Fair stability (some rows are weakly dominant).',
+                    risky: 'Risky stability (non-dominant rows may slow or prevent convergence).'
+                };
+
+                html += '<div class="diagnostics-panel">';
+                html += '<h3>Competition Edge: Convergence Diagnostics</h3>';
+                html += `<p><strong>Stability grade:</strong> ${d.stability.toUpperCase()} — ${stabilityText[d.stability] || ''}</p>`;
+                html += `<p><strong>Minimum dominance margin:</strong> ${d.minimumMargin.toExponential(3)}</p>`;
+                html += `<p><strong>Residual ||Ax-b||∞:</strong> ${d.residualInfinityNorm.toExponential(3)}</p>`;
+
+                html += '<table class="diagnostics-table">';
+                html += '<tr><th>Row</th><th>|aᵢᵢ|</th><th>Σ|aᵢⱼ|, j≠i</th><th>Margin</th><th>Ratio</th><th>Status</th></tr>';
+                for (const row of d.rowMetrics) {
+                    const ratioText = Number.isFinite(row.ratio) ? row.ratio.toFixed(3) : '∞';
+                    html += '<tr>';
+                    html += `<td>${row.row}</td>`;
+                    html += `<td>${row.diagAbs.toFixed(4)}</td>`;
+                    html += `<td>${row.offDiagAbs.toFixed(4)}</td>`;
+                    html += `<td>${row.margin.toExponential(2)}</td>`;
+                    html += `<td>${ratioText}</td>`;
+                    html += `<td><span class="status-pill status-${row.status}">${row.status.replace('_', ' ')}</span></td>`;
+                    html += '</tr>';
+                }
+                html += '</table>';
+                html += '</div>';
+            }
 
             if (result.converged) {
                 html += '<div class="final-solution">';
@@ -1003,12 +1583,19 @@ def solve():
     try:
         data = request.json
         mode = data.get('mode')
+        tol = float(data.get('tol', 1e-4))
+        max_iter = int(data.get('maxIter', 1000))
+        if tol <= 0:
+            raise ValueError('Tolerance must be positive')
+        if max_iter < 1:
+            raise ValueError('Maximum iterations must be at least 1')
 
         if mode == 'matrix':
             A = data.get('A')
             b = data.get('b')
             n = len(A)
             variables = [chr(120 + i) for i in range(n)]  # x, y, z, ...
+            input_payload = {'A': A, 'b': b}
 
         elif mode == 'equation':
             equations = data.get('equations')
@@ -1029,6 +1616,7 @@ def solve():
                 coeffs, const = parse_equation(eq, var_to_idx)
                 A.append(coeffs)
                 b.append(const)
+            input_payload = {'equations': equations}
         
         else:
             return jsonify({'error': 'Invalid mode'}), 400
@@ -1037,11 +1625,44 @@ def solve():
         A, b = prepare_matrix(A, b)
 
         # Solve
-        result = gauss_seidel(A, b, variables)
+        result = gauss_seidel(A, b, variables, tol=tol, max_iter=max_iter)
         result['variables'] = variables
+        result['diagnostics'] = analyze_system(A, b, result['solution'])
+
+        save_history_entry(
+            {
+                'mode': mode,
+                'tol': tol,
+                'maxIter': max_iter,
+                'variables': variables,
+                'input': input_payload,
+            },
+            result,
+        )
 
         return jsonify(result)
 
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
+
+
+@app.route('/history', methods=['GET'])
+def history():
+    """Return latest solver calculations from SQLite history."""
+    try:
+        limit = int(request.args.get('limit', 20))
+        limit = max(1, min(limit, 100))
+        return jsonify({'history': fetch_history(limit)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
+
+
+@app.route('/history/clear', methods=['POST'])
+def clear_history_route():
+    """Clear all persisted history entries."""
+    try:
+        clear_history()
+        return jsonify({'ok': True})
     except Exception as e:
         return jsonify({'error': str(e)}), 400
 
