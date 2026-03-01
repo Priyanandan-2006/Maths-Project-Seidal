@@ -1,7 +1,8 @@
 """
- Gauss-Seidel Solver Web Application
- Integrates the original Python solver with the HTML interface
- """
+Gauss-Seidel Solver Web Application
+Integrates the original Python solver with the HTML interface
+"""
+
 from flask import Flask, render_template_string, request, jsonify
 import re
 import json
@@ -10,7 +11,6 @@ from datetime import datetime
 from math import isclose
 
 app = Flask(__name__)
-
 
 DB_PATH = 'solver_history.db'
 
@@ -103,7 +103,9 @@ def clear_history() -> None:
         conn.execute('DELETE FROM solve_history')
         conn.commit()
 
+
 init_db()
+
 
 # ────────────────────────────────────────────────
 # Parse single equation → coefficients + constant
@@ -130,119 +132,74 @@ def parse_equation(eq: str, var_to_idx: dict) -> tuple:
     while i < len(left):
         m = re.match(pattern, left[i:])
         if not m:
-            raise ValueError(f"Invalid syntax near: {left[i:]}")
+            i += 1
+            continue
 
-        groups = m.groups()
-        # groups = (sign1, coeff_num, var1, sign2, var2)
-        sign1, coeff_str, var1, sign2, var2 = groups
+        sign_str, coeff_str, var, sign2, var2 = m.groups()
 
-        if var1:  # case: sign + coeff + var
-            s = sign1 if sign1 else implicit_sign
-            c_str = coeff_str if coeff_str else "1"
-            c = float(c_str) if s == "+" else -float(c_str)
-            if var1 not in var_to_idx:
-                raise ValueError(f"Unknown variable '{var1}'")
-            coeffs[var_to_idx[var1]] += c
+        if var2:  # case: +x or -y
+            sign = sign2
+            coeff = 1.0
+            var = var2
+        else:
+            sign = sign_str if sign_str else implicit_sign
+            coeff = float(coeff_str) if coeff_str and coeff_str != "." else 1.0
+            var = var
 
-        elif var2:  # case: sign + var (no coeff digit)
-            s = sign2
-            c = 1.0 if s == "+" else -1.0
-            if var2 not in var_to_idx:
-                raise ValueError(f"Unknown variable '{var2}'")
-            coeffs[var_to_idx[var2]] += c
+        if sign == "-":
+            coeff = -coeff
 
-        implicit_sign = "+"  # once we've seen a sign/term, next is explicit
-        i += len(m.group(0))
+        if var in var_to_idx:
+            coeffs[var_to_idx[var]] = coeff
+        else:
+            raise ValueError(f"Unknown variable '{var}' in equation")
 
-    return (coeffs, rhs)
+        i += m.end()
+        implicit_sign = "+"  # after first term
+
+    return coeffs, rhs
 
 
-# ────────────────────────────────────────────────
-# Diagonal dominance check & row swapping
-# ────────────────────────────────────────────────
-def prepare_matrix(A: list, b: list) -> tuple:
-    """
-    Attempt to rearrange rows for diagonal dominance.
-    Returns the possibly swapped (A, b).
-    """
+def prepare_matrix(A, b):
+    """Validate and normalize matrix input"""
     n = len(A)
-    used_rows = [False] * n
-    new_A = []
-    new_b = []
+    if len(b) != n:
+        raise ValueError("Length of b must match number of rows in A")
 
-    for col in range(n):
-        best_row = -1
-        best_ratio = -1.0
+    for row in A:
+        if len(row) != n:
+            raise ValueError("Matrix A must be square")
 
-        for row in range(n):
-            if used_rows[row]:
-                continue
-            diag_val = abs(A[row][col])
-            off_sum = sum(abs(A[row][j]) for j in range(n) if j != col)
-            if diag_val > 1e-12:
-                ratio = diag_val / (off_sum + 1e-12)
-                if ratio > best_ratio:
-                    best_ratio = ratio
-                    best_row = row
+    # Convert to float
+    A = [[float(x) for x in row] for row in A]
+    b = [float(x) for x in b]
 
-        if best_row == -1:
-            # No suitable row found for this column
-            # Just pick the first unused row
-            for row in range(n):
-                if not used_rows[row]:
-                    best_row = row
-                    break
-
-        used_rows[best_row] = True
-        new_A.append(A[best_row])
-        new_b.append(b[best_row])
-
-    return (new_A, new_b)
+    return A, b
 
 
-# ────────────────────────────────────────────────
-# Gauss-Seidel Solver
-# ────────────────────────────────────────────────
-def gauss_seidel(
-    A: list,
-    b: list,
-    variables: list,
-    tol: float = 1e-4,
-    max_iter: int = 1000
-) -> dict:
-    """
-    Solve Ax = b using Gauss-Seidel iteration.
-    
-    Args:
-        A: coefficient matrix (n x n)
-        b: constants vector (n)
-        variables: list of variable names
-        tol: convergence tolerance
-        max_iter: maximum iterations
-    
-    Returns:
-        dict with converged, iterations, solution, iterCount
-    """
+def gauss_seidel(A, b, variables, tol=1e-4, max_iter=1000):
+    """Gauss-Seidel iterative solver with detailed logging"""
     n = len(A)
     x = [0.0] * n
     iterations_log = []
 
     for iteration in range(1, max_iter + 1):
-        x_old = x[:]
+        max_delta = 0.0
         details = []
-        
+
         for i in range(n):
-            sigma = sum(A[i][j] * x[j] for j in range(n) if j != i)
-            x[i] = (b[i] - sigma) / A[i][i]
-            
-            delta = abs(x[i] - x_old[i])
+            old_xi = x[i]
+            sum_other = sum(A[i][j] * x[j] for j in range(n) if j != i)
+            x[i] = (b[i] - sum_other) / A[i][i]
+
+            delta = abs(x[i] - old_xi)
+            max_delta = max(max_delta, delta)
+
             details.append({
                 'variable': variables[i],
                 'value': x[i],
                 'delta': delta
             })
-
-        max_delta = max(d['delta'] for d in details)
 
         # Store iteration details (first 10 or every 20th)
         if iteration <= 10 or iteration % 20 == 0:
@@ -324,6 +281,79 @@ def analyze_system(A: list, b: list, x: list) -> dict:
         'residualInfinityNorm': inf_norm,
         'stability': stability,
     }
+
+
+def build_domain_system(domain: str, params: dict) -> tuple:
+    """Build domain-specific linear systems to solve with Gauss-Seidel."""
+    domain = (domain or '').strip().lower()
+
+    if domain == 'electrical':
+        r1 = float(params.get('r1', 12))
+        r2 = float(params.get('r2', 10))
+        r3 = float(params.get('r3', 8))
+        rm = float(params.get('rm', 2))
+        v1 = float(params.get('v1', 24))
+        v2 = float(params.get('v2', 18))
+        v3 = float(params.get('v3', 12))
+
+        variables = ['I1', 'I2', 'I3']
+        A = [
+            [r1 + rm + 1, -rm, 0],
+            [-rm, r2 + (2 * rm) + 1, -rm],
+            [0, -rm, r3 + rm + 1],
+        ]
+        b = [v1, v2, v3]
+        title = 'Electrical Circuit Solver (Mesh Currents)'
+
+    elif domain == 'structural':
+        w = float(params.get('w', 120))
+        xbar = float(params.get('xbar', 4))
+        l1 = float(params.get('l1', 3))
+        l2 = float(params.get('l2', 8))
+        ka = float(params.get('ka', 2.0))
+        kb = float(params.get('kb', 1.6))
+        kc = float(params.get('kc', 1.2))
+        lateral = float(params.get('lateral', 18))
+
+        variables = ['RA', 'RB', 'RC']
+        A = [
+            [1, 1, 1],
+            [0, l1, l2],
+            [ka + 1, -(kb + 0.5), kc + 1],
+        ]
+        b = [w, w * xbar, lateral]
+        title = 'Structural Engineering Load Reactions'
+
+    elif domain == 'economics':
+        d1 = float(params.get('d1', 130))
+        d2 = float(params.get('d2', 125))
+        d3 = float(params.get('d3', 120))
+        variables = ['P1', 'P2', 'P3']
+        A = [
+            [10, -2, -1],
+            [-1, 11, -2],
+            [-2, -1, 12],
+        ]
+        b = [d1, d2, d3]
+        title = 'Economics Equilibrium Model (Market Prices)'
+
+    elif domain == 'chemical':
+        c1 = float(params.get('c1', 42))
+        c2 = float(params.get('c2', 38))
+        c3 = float(params.get('c3', 30))
+        variables = ['A', 'B', 'C']
+        A = [
+            [9, -2, -1],
+            [-1, 10, -2],
+            [-2, -1, 9],
+        ]
+        b = [c1, c2, c3]
+        title = 'Chemical Balance System (Species Rates)'
+
+    else:
+        raise ValueError('Unknown domain model selected')
+
+    return A, b, variables, title
 
 
 # ────────────────────────────────────────────────
@@ -451,6 +481,7 @@ HTML_TEMPLATE = '''
         }
 
         .mode-selector {
+            display: inline-flex;
             background: #eef2ff;
             border-radius: 12px;
             padding: 5px;
@@ -526,74 +557,73 @@ HTML_TEMPLATE = '''
         label {
             display: block;
             margin-bottom: 10px;
-            font-weight: 700;
+            font-weight: 600;
             color: #1f2937;
-            font-size: 14px;
-            letter-spacing: 0.3px;
         }
 
-        input[type="number"],
-        input[type="text"] {
+        input, select {
             width: 100%;
-            padding: 12px 16px;
+            padding: 12px 14px;
             border: 2px solid #e5e7eb;
             border-radius: 8px;
-            font-size: 14px;
-            transition: all 0.2s ease;
-            background: white;
-            font-family: inherit;
+            font-size: 15px;
+            transition: all 0.2s;
         }
 
-        input[type="number"]:focus,
-        input[type="text"]:focus {
+        input:focus, select:focus {
             outline: none;
-            border-color: #667eea;
-            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+            border-color: #6366f1;
+            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
+        }
+
+        .matrix-input {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
         }
 
         .matrix-row {
             display: flex;
-            gap: 12px;
-            margin-bottom: 12px;
-            align-items: center;
+            gap: 8px;
         }
 
         .matrix-row input {
             flex: 1;
-            min-width: 0;
+            text-align: center;
         }
 
-        .matrix-label {
-            font-weight: 600;
-            color: #667eea;
-            min-width: 30px;
-            font-size: 13px;
-        }
-
-        .equation-input-wrapper {
+        .equation-input {
             display: flex;
+            align-items: center;
             gap: 12px;
             margin-bottom: 12px;
-            align-items: center;
         }
 
         .equation-number {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
             width: 32px;
             height: 32px;
-            border-radius: 8px;
+            background: #6366f1;
+            color: white;
+            border-radius: 50%;
             display: flex;
             align-items: center;
             justify-content: center;
-            font-weight: 700;
-            font-size: 13px;
+            font-weight: bold;
             flex-shrink: 0;
-            box-shadow: 0 2px 8px rgba(102, 126, 234, 0.3);
         }
 
-        .equation-input-wrapper input {
+        .equation-input input {
             flex: 1;
+        }
+
+        .info-box {
+            background: rgba(99, 102, 241, 0.08);
+            border: 1px solid rgba(99, 102, 241, 0.2);
+            padding: 16px;
+            border-radius: 10px;
+            margin-top: 16px;
+            font-size: 14px;
+            line-height: 1.5;
         }
 
         .solve-btn {
@@ -602,105 +632,14 @@ HTML_TEMPLATE = '''
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
             border: none;
-            border-radius: 10px;
-            font-size: 16px;
+            border-radius: 12px;
+            font-size: 18px;
             font-weight: 700;
             cursor: pointer;
             transition: all 0.3s ease;
-            box-shadow: 0 4px 16px rgba(102, 126, 234, 0.4);
-            position: relative;
-            overflow: hidden;
+            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.3);
+            margin: 20px 0;
         }
-
-        .solve-btn::before {
-            content: '';
-            position: absolute;
-            top: 50%;
-            left: 50%;
-            width: 0;
-            height: 0;
-            border-radius: 50%;
-            background: rgba(255, 255, 255, 0.3);
-            transform: translate(-50%, -50%);
-            transition: width 0.6s, height 0.6s;
-        }
-
-        .solve-btn:hover::before {
-            width: 300px;
-            height: 300px;
-        }
-
-        .solve-btn span {
-            position: relative;
-            z-index: 1;
-        }
-
-        .loading {
-            display: inline-block;
-            width: 14px;
-            height: 14px;
-            border: 2px solid rgba(255, 255, 255, 0.3);
-            border-top-color: white;
-            border-radius: 50%;
-            animation: spin 0.6s linear infinite;
-            margin-right: 8px;
-            vertical-align: middle;
-        }
-
-        @keyframes spin {
-            to {
-                transform: rotate(360deg);
-            }
-        }
-
-        .solve-btn::after {
-            content: '→';
-            position: absolute;
-            right: 24px;
-            top: 50%;
-            transform: translateY(-50%);
-            font-size: 20px;
-            opacity: 0;
-            transition: all 0.3s ease;
-        }
-
-        .solve-btn:hover::after {
-            opacity: 1;
-            right: 20px;
-        }
-
-        .solve-btn:not(:disabled):hover::after {
-            animation: slideArrow 0.6s ease-in-out infinite;
-        }
-
-        @keyframes slideArrow {
-            0%, 100% {
-                transform: translateY(-50%) translateX(0);
-            }
-            50% {
-                transform: translateY(-50%) translateX(4px);
-            }
-        }
-
-        .solve-btn span {
-            transition: transform 0.3s ease;
-        }
-
-        .solve-btn:hover span {
-            transform: translateX(-8px);
-        }
-
-        .solve-btn .loading {
-            position: absolute;
-            left: 50%;
-            top: 50%;
-            transform: translate(-50%, -50%);
-            margin: 0;
-        }
-
-        .solve-btn:hover .loading {
-            left: calc(50% - 10px);
-}
 
         .solve-btn:hover:not(:disabled) {
             background: linear-gradient(135deg, #764ba2 0%, #667eea 100%);
@@ -758,153 +697,84 @@ HTML_TEMPLATE = '''
             border-radius: 5px;
         }
 
-        .results-content::-webkit-scrollbar-thumb:hover {
-            background: linear-gradient(180deg, #764ba2 0%, #667eea 100%);
-        }
-
         .iteration-block {
-            background: linear-gradient(135deg, #f9fafb 0%, #f3f4f6 100%);
-            border-left: 4px solid #667eea;
-            padding: 20px;
-            margin-bottom: 16px;
-            border-radius: 8px;
-            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
-            transition: transform 0.2s ease, box-shadow 0.2s ease;
-        }
-
-        .iteration-block:hover {
-            transform: translateX(4px);
-            box-shadow: 0 4px 16px rgba(102, 126, 234, 0.15);
+            margin-bottom: 24px;
+            padding: 16px;
+            background: #f8fafc;
+            border-radius: 10px;
+            border: 1px solid #e5e7eb;
         }
 
         .iteration-header {
             font-weight: 700;
-            color: #667eea;
-            margin-bottom: 16px;
-            font-size: 15px;
-            letter-spacing: 0.5px;
-            text-transform: uppercase;
+            color: #1e40af;
+            margin-bottom: 12px;
+            font-size: 16px;
         }
 
         .variable-value {
             display: flex;
             justify-content: space-between;
-            align-items: center;
-            padding: 10px 0;
-            border-bottom: 1px solid #e5e7eb;
-            font-size: 14px;
-        }
-
-        .variable-value:last-of-type {
-            border-bottom: none;
+            margin-bottom: 8px;
+            font-family: 'SF Mono', Monaco, Consolas, monospace;
         }
 
         .variable-name {
-            font-weight: 700;
-            color: #1f2937;
-            font-size: 15px;
+            color: #1e3a8a;
+            font-weight: 600;
         }
 
         .variable-number {
-            font-family: 'SF Mono', Monaco, Consolas, monospace;
-            color: #4b5563;
-            font-weight: 600;
+            color: #059669;
+            font-weight: 700;
         }
 
         .delta {
-            color: #6b7280;
-            font-size: 12px;
-            font-family: 'SF Mono', Monaco, Consolas, monospace;
-            background: #f3f4f6;
-            padding: 4px 10px;
-            border-radius: 6px;
-            font-weight: 600;
+            color: #dc2626;
+            font-size: 0.9em;
         }
 
         .max-change {
-            margin-top: 14px;
-            padding-top: 14px;
-            border-top: 2px dashed #d1d5db;
-            color: #6b7280;
-            font-size: 13px;
+            margin-top: 12px;
+            padding-top: 12px;
+            border-top: 1px dashed #cbd5e1;
             font-weight: 600;
-            font-family: 'SF Mono', Monaco, Consolas, monospace;
+            color: #7c3aed;
         }
 
         .final-solution {
+            margin-top: 32px;
+            padding: 24px;
             background: linear-gradient(135deg, #ecfdf5 0%, #d1fae5 100%);
             border: 2px solid #6ee7b7;
-            padding: 24px;
             border-radius: 12px;
-            margin-top: 24px;
-            box-shadow: 0 4px 16px rgba(52, 211, 153, 0.2);
         }
 
         .final-solution h3 {
-            color: #047857;
-            margin-bottom: 18px;
-            font-size: 18px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
+            color: #065f46;
+            margin-bottom: 16px;
         }
 
         .solution-item {
             display: flex;
             justify-content: space-between;
-            align-items: center;
-            padding: 14px 0;
+            padding: 12px 0;
             border-bottom: 1px solid #a7f3d0;
-            font-size: 15px;
+            font-size: 18px;
+            font-weight: 600;
         }
 
         .solution-item:last-child {
             border-bottom: none;
         }
 
-        .solution-item span:first-child {
-            font-weight: 700;
-            color: #065f46;
-            font-size: 16px;
-        }
-
-        .solution-item span:last-child {
-            font-family: 'SF Mono', Monaco, Consolas, monospace;
-            color: #047857;
-            font-size: 18px;
-            font-weight: 700;
-        }
-
         .error-message {
-            background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%);
-            border: 2px solid #f87171;
+            background: #fee2e2;
             color: #991b1b;
-            padding: 20px;
-            border-radius: 12px;
-            margin-top: 24px;
-            font-size: 14px;
-            box-shadow: 0 4px 16px rgba(239, 68, 68, 0.2);
-        }
-
-        .error-message strong {
-            display: block;
-            margin-bottom: 8px;
-            font-size: 15px;
-        }
-
-        .info-box {
-            background: linear-gradient(135deg, #dbeafe 0%, #bfdbfe 100%);
-            border: 1px solid #93c5fd;
             padding: 16px;
-            border-radius: 8px;
-            margin-top: 16px;
-            color: #1e40af;
-            font-size: 13px;
-        }
-
-        .info-box strong {
-            font-weight: 700;
-            color: #1e3a8a;
+            border-radius: 10px;
+            margin-top: 20px;
+            border: 1px solid #fecaca;
         }
 
         .badge {
@@ -920,8 +790,6 @@ HTML_TEMPLATE = '''
             border: 1px solid rgba(255, 255, 255, 0.3);
             box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
         }
-
-
 
         .action-row {
             display: grid;
@@ -1009,6 +877,67 @@ HTML_TEMPLATE = '''
         .history-status.warn {
             background: #fee2e2;
             color: #991b1b;
+        }
+
+        .domain-card {
+            background: linear-gradient(135deg, #ecfeff 0%, #eef2ff 100%);
+            border: 1px solid #bae6fd;
+            border-radius: 12px;
+            padding: 16px;
+            margin-top: 12px;
+        }
+
+        .domain-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+            gap: 10px;
+            margin-top: 10px;
+        }
+
+        .domain-note {
+            margin-top: 10px;
+            color: #0f172a;
+            font-size: 13px;
+        }
+
+        .result-domain {
+            background: linear-gradient(135deg, #ede9fe 0%, #dbeafe 100%);
+            border: 1px solid #c4b5fd;
+            color: #3730a3;
+            border-radius: 10px;
+            padding: 10px 14px;
+            margin-top: 14px;
+            font-size: 13px;
+            font-weight: 700;
+        }
+
+        .explain-panel {
+            margin-top: 16px;
+            background: linear-gradient(135deg, #ecfeff 0%, #eef2ff 100%);
+            border: 1px solid #93c5fd;
+            border-radius: 12px;
+            padding: 16px;
+            color: #0f172a;
+        }
+
+        .explain-panel h3 {
+            color: #1e3a8a;
+            margin-bottom: 8px;
+            font-size: 16px;
+        }
+
+        .explain-panel ul {
+            margin-left: 18px;
+            margin-top: 8px;
+            font-size: 13px;
+            line-height: 1.6;
+        }
+
+        .explain-panel code {
+            background: #e0e7ff;
+            border-radius: 4px;
+            padding: 1px 6px;
+            font-size: 12px;
         }
 
         .diagnostics-panel {
@@ -1196,6 +1125,9 @@ HTML_TEMPLATE = '''
             <button class="mode-btn" onclick="setMode('equation')" id="equationBtn">
                 Equation Form
             </button>
+            <button class="mode-btn" onclick="setMode('domain')" id="domainBtn">
+                Domain Models
+            </button>
         </div>
 
         <div id="matrixMode" class="input-section">
@@ -1231,6 +1163,22 @@ HTML_TEMPLATE = '''
             </div>
         </div>
 
+        <div id="domainMode" class="input-section" style="display: none;">
+            <div class="form-group">
+                <label>Engineering/Science Model:</label>
+                <select id="domainType" onchange="generateDomainInputs()" style="width:100%;padding:11px 14px;border:2px solid #e5e7eb;border-radius:8px;font-size:14px;background:white;">
+                    <option value="electrical">Electrical Circuit Solver</option>
+                    <option value="structural">Structural Engineering Loads</option>
+                    <option value="economics">Economics Equilibrium Model</option>
+                    <option value="chemical">Chemical Balance Systems</option>
+                </select>
+            </div>
+            <div class="domain-card">
+                <div id="domainInputs" class="domain-grid"></div>
+                <div id="domainDescription" class="domain-note"></div>
+            </div>
+        </div>
+
         <div class="input-section" style="margin-top: 0;">
             <div class="form-group">
                 <label>Tolerance:</label>
@@ -1249,25 +1197,34 @@ HTML_TEMPLATE = '''
             <button class="secondary-btn" onclick="toggleHistory()">View History</button>
             <button class="secondary-btn clear-btn" onclick="clearHistoryRecords()">Clear History</button>
         </div>
+        <div style="margin-top:10px;">
+            <button class="secondary-btn" onclick="toggleExplanation()" style="width:100%;">📘 Explanation: How this was solved</button>
+        </div>
 
         <div id="results" style="display: none;"></div>
+        <div id="explanationPanel" class="explain-panel" style="display: none;"></div>
         <div id="historyPanel" class="history-panel" style="display: none;"></div>
     </div>
 
     <script>
         let currentMode = 'matrix';
+        let lastResult = null;
 
         function setMode(mode) {
             currentMode = mode;
             document.getElementById('matrixBtn').classList.toggle('active', mode === 'matrix');
             document.getElementById('equationBtn').classList.toggle('active', mode === 'equation');
+            document.getElementById('domainBtn').classList.toggle('active', mode === 'domain');
             document.getElementById('matrixMode').style.display = mode === 'matrix' ? 'block' : 'none';
             document.getElementById('equationMode').style.display = mode === 'equation' ? 'block' : 'none';
+            document.getElementById('domainMode').style.display = mode === 'domain' ? 'block' : 'none';
             
             if (mode === 'matrix') {
                 generateMatrixInputs();
-            } else {
+            } else if (mode === 'equation') {
                 generateEquationInputs();
+            } else {
+                generateDomainInputs();
             }
         }
 
@@ -1279,53 +1236,37 @@ HTML_TEMPLATE = '''
             matrixInputs.innerHTML = '';
             constantInputs.innerHTML = '';
 
-            // Default values for 3x3 system
-            const defaultA = [
-                [10, -1, 2],
-                [-1, 11, -1],
-                [2, -1, 10]
-            ];
-            const defaultB = [6, 25, -11];
+            const matrixContainer = document.createElement('div');
+            matrixContainer.className = 'matrix-input';
 
             for (let i = 0; i < n; i++) {
                 const row = document.createElement('div');
                 row.className = 'matrix-row';
-
-                const label = document.createElement('span');
-                label.className = 'matrix-label';
-                label.textContent = `Row ${i + 1}:`;
-                row.appendChild(label);
+                row.style.animationDelay = `${i * 0.05}s`;
 
                 for (let j = 0; j < n; j++) {
                     const input = document.createElement('input');
                     input.type = 'number';
                     input.step = 'any';
-                    input.id = `a${i}_${j}`;
                     input.placeholder = `a${i+1}${j+1}`;
-                    input.value = (i < 3 && j < 3) ? defaultA[i][j] : (i === j ? 1 : 0);
+                    input.id = `a${i}_${j}`;
                     row.appendChild(input);
                 }
-
-                matrixInputs.appendChild(row);
-
-                const constRow = document.createElement('div');
-                constRow.className = 'matrix-row';
-
-                const constLabel = document.createElement('span');
-                constLabel.className = 'matrix-label';
-                constLabel.textContent = `b${i + 1}:`;
-                constRow.appendChild(constLabel);
-
-                const constInput = document.createElement('input');
-                constInput.type = 'number';
-                constInput.step = 'any';
-                constInput.id = `b${i}`;
-                constInput.placeholder = `b${i+1}`;
-                constInput.value = (i < 3) ? defaultB[i] : 0;
-                constRow.appendChild(constInput);
-
-                constantInputs.appendChild(constRow);
+                matrixContainer.appendChild(row);
             }
+            matrixInputs.appendChild(matrixContainer);
+
+            const constContainer = document.createElement('div');
+            constContainer.className = 'matrix-input';
+            for (let i = 0; i < n; i++) {
+                const input = document.createElement('input');
+                input.type = 'number';
+                input.step = 'any';
+                input.placeholder = `b${i+1}`;
+                input.id = `b${i}`;
+                constContainer.appendChild(input);
+            }
+            constantInputs.appendChild(constContainer);
         }
 
         function generateEquationInputs() {
@@ -1334,14 +1275,15 @@ HTML_TEMPLATE = '''
             container.innerHTML = '';
 
             const examples = [
-                '10x - y + 2z = 6',
-                '-x + 11y - z = 25',
-                '2x - y + 10z = -11'
+                '10x - 2y - z = 3',
+                '-x + 11y - 2z = 25',
+                '-2x - y + 10z = -24'
             ];
 
             for (let i = 0; i < n; i++) {
                 const div = document.createElement('div');
-                div.className = 'equation-input-wrapper';
+                div.className = 'equation-input';
+                div.style.animationDelay = `${i * 0.05}s`;
 
                 const number = document.createElement('div');
                 number.className = 'equation-number';
@@ -1356,6 +1298,62 @@ HTML_TEMPLATE = '''
                 div.appendChild(number);
                 div.appendChild(input);
                 container.appendChild(div);
+            }
+        }
+
+        function getDomainConfig(type) {
+            const configs = {
+                electrical: {
+                    description: 'Solve mesh currents from Kirchhoff voltage laws. Great for multi-loop circuit analysis.',
+                    fields: [
+                        ['r1', 'R1 (Ω)', 12], ['r2', 'R2 (Ω)', 10], ['r3', 'R3 (Ω)', 8],
+                        ['rm', 'Mutual Rm (Ω)', 2], ['v1', 'V1 (V)', 24], ['v2', 'V2 (V)', 18], ['v3', 'V3 (V)', 12],
+                    ],
+                },
+                structural: {
+                    description: 'Estimate support reactions using load balance + moment equilibrium + lateral compatibility.',
+                    fields: [
+                        ['w', 'Total Load W (kN)', 120], ['xbar', 'Centroid x̄ (m)', 4], ['l1', 'L1 (m)', 3], ['l2', 'L2 (m)', 8],
+                        ['ka', 'Stiffness kA', 2.0], ['kb', 'Stiffness kB', 1.6], ['kc', 'Stiffness kC', 1.2], ['lateral', 'Lateral eq. term', 18],
+                    ],
+                },
+                economics: {
+                    description: 'Find market equilibrium prices for three interdependent sectors from linearized demand-supply equations.',
+                    fields: [
+                        ['d1', 'Demand Constant D1', 130], ['d2', 'Demand Constant D2', 125], ['d3', 'Demand Constant D3', 120],
+                    ],
+                },
+                chemical: {
+                    description: 'Balance three species rates under coupled reaction constraints (steady-state approximation).',
+                    fields: [
+                        ['c1', 'Constraint C1', 42], ['c2', 'Constraint C2', 38], ['c3', 'Constraint C3', 30],
+                    ],
+                },
+            };
+            return configs[type] || configs.electrical;
+        }
+
+        function generateDomainInputs() {
+            const type = document.getElementById('domainType').value;
+            const config = getDomainConfig(type);
+            const container = document.getElementById('domainInputs');
+            const description = document.getElementById('domainDescription');
+            container.innerHTML = '';
+            description.textContent = config.description;
+
+            for (const [name, label, val] of config.fields) {
+                const wrap = document.createElement('div');
+                const l = document.createElement('label');
+                l.textContent = label;
+                l.style.marginBottom = '6px';
+                const input = document.createElement('input');
+                input.type = 'number';
+                input.step = 'any';
+                input.id = `domain_${name}`;
+                input.value = val;
+                wrap.appendChild(l);
+                wrap.appendChild(input);
+                container.appendChild(wrap);
             }
         }
 
@@ -1398,7 +1396,7 @@ HTML_TEMPLATE = '''
 
                     requestData.A = A;
                     requestData.b = b;
-                } else {
+                } else if (currentMode === 'equation') {
                     const n = parseInt(document.getElementById('numEquations').value);
                     const equations = [];
 
@@ -1409,6 +1407,17 @@ HTML_TEMPLATE = '''
                     }
 
                     requestData.equations = equations;
+                } else {
+                    const domainType = document.getElementById('domainType').value;
+                    const config = getDomainConfig(domainType);
+                    const params = {};
+                    for (const [name] of config.fields) {
+                        const val = parseFloat(document.getElementById(`domain_${name}`).value);
+                        if (isNaN(val)) throw new Error(`Invalid domain value: ${name}`);
+                        params[name] = val;
+                    }
+                    requestData.domainType = domainType;
+                    requestData.domainParams = params;
                 }
 
                 const response = await fetch('/solve', {
@@ -1425,6 +1434,7 @@ HTML_TEMPLATE = '''
                     throw new Error(result.error);
                 }
 
+                lastResult = result;
                 displayResults(result);
                 await loadHistory();
 
@@ -1436,7 +1446,6 @@ HTML_TEMPLATE = '''
                 solveText.innerHTML = 'Compute Solution';
             }
         }
-
 
         async function loadHistory() {
             const historyPanel = document.getElementById('historyPanel');
@@ -1491,6 +1500,65 @@ HTML_TEMPLATE = '''
             }
         }
 
+        function buildExplanationHtml(result) {
+            const domainText = result.domainTitle
+                ? `This run used the domain template: <code>${result.domainTitle}</code>.`
+                : 'This run used your direct matrix/equation inputs.';
+
+            const firstLogged = (result.iterations && result.iterations.length > 0) ? result.iterations[0] : null;
+            let firstIterHtml = '';
+            if (firstLogged) {
+                const samples = firstLogged.details
+                    .map(d => `<li><code>${d.variable}</code> updated to <code>${Number(d.value).toFixed(6)}</code> (Δ=${Number(d.delta).toExponential(2)})</li>`)
+                    .join('');
+                firstIterHtml = `<p><strong>First logged iteration (Iteration ${firstLogged.number}):</strong></p><ul>${samples}</ul>`;
+            }
+
+            const diagnostics = result.diagnostics || {};
+            const stability = diagnostics.stability ? diagnostics.stability.toUpperCase() : 'N/A';
+            const residual = diagnostics.residualInfinityNorm !== undefined
+                ? Number(diagnostics.residualInfinityNorm).toExponential(3)
+                : 'N/A';
+
+            return `
+                <h3>How to do it (Gauss-Seidel method)</h3>
+                <ul>
+                    <li>Start with an initial guess for all unknowns (this app uses 0 for each variable).</li>
+                    <li>Rearrange each equation in iterative form and update each variable sequentially.</li>
+                    <li>After each full pass, compute max change <code>max |xᵢ(new)-xᵢ(old)|</code>.</li>
+                    <li>Stop when max change is below tolerance or when max iterations is reached.</li>
+                </ul>
+                <p>${domainText}</p>
+                ${firstIterHtml}
+                <p><strong>Convergence summary:</strong> ${result.converged ? 'Converged' : 'Not converged'} in ${result.iterCount} iterations.</p>
+                <p><strong>Diagnostics summary:</strong> Stability <code>${stability}</code>, residual norm <code>${residual}</code>.</p>
+            `;
+        }
+
+        function toggleExplanation() {
+            const panel = document.getElementById('explanationPanel');
+            const show = panel.style.display === 'none';
+            panel.style.display = show ? 'block' : 'none';
+
+            if (!show) return;
+
+            if (!lastResult) {
+                panel.innerHTML = `
+                    <h3>How to do it (Gauss-Seidel method)</h3>
+                    <p>Run a solve first, then click this button again to see a step-by-step explanation using your own result.</p>
+                    <ul>
+                        <li>Pick mode (Matrix, Equation, or Domain Model).</li>
+                        <li>Enter coefficients/constants and solver settings.</li>
+                        <li>Press <code>Compute Solution</code>.</li>
+                        <li>Open this explanation panel for a guided breakdown.</li>
+                    </ul>
+                `;
+                return;
+            }
+
+            panel.innerHTML = buildExplanationHtml(lastResult);
+        }
+
         function displayResults(result) {
             const resultsDiv = document.getElementById('results');
             let html = '<div class="results-header">Iteration Log</div>';
@@ -1514,6 +1582,10 @@ HTML_TEMPLATE = '''
             }
 
             html += '</div>';
+
+            if (result.domainTitle) {
+                html += `<div class="result-domain">🚀 Domain Solver: ${result.domainTitle}</div>`;
+            }
 
             if (result.diagnostics) {
                 const d = result.diagnostics;
@@ -1566,10 +1638,12 @@ HTML_TEMPLATE = '''
 
         // Initialize
         generateMatrixInputs();
+        generateDomainInputs();
     </script>
 </body>
 </html>
 '''
+
 
 @app.route('/')
 def index():
@@ -1617,7 +1691,16 @@ def solve():
                 A.append(coeffs)
                 b.append(const)
             input_payload = {'equations': equations}
-        
+
+        elif mode == 'domain':
+            domain_type = data.get('domainType')
+            domain_params = data.get('domainParams', {})
+            A, b, variables, domain_title = build_domain_system(domain_type, domain_params)
+            input_payload = {
+                'domainType': domain_type,
+                'domainParams': domain_params,
+            }
+
         else:
             return jsonify({'error': 'Invalid mode'}), 400
 
@@ -1628,6 +1711,8 @@ def solve():
         result = gauss_seidel(A, b, variables, tol=tol, max_iter=max_iter)
         result['variables'] = variables
         result['diagnostics'] = analyze_system(A, b, result['solution'])
+        if mode == 'domain':
+            result['domainTitle'] = domain_title
 
         save_history_entry(
             {
