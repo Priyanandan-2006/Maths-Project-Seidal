@@ -322,6 +322,81 @@ def analyze_system(A: list, b: list, x: list) -> dict:
     }
 
 
+
+
+def build_domain_system(domain: str, params: dict) -> tuple:
+    """Build domain-specific linear systems to solve with Gauss-Seidel."""
+    domain = (domain or '').strip().lower()
+
+    if domain == 'electrical':
+        r1 = float(params.get('r1', 12))
+        r2 = float(params.get('r2', 10))
+        r3 = float(params.get('r3', 8))
+        rm = float(params.get('rm', 2))
+        v1 = float(params.get('v1', 24))
+        v2 = float(params.get('v2', 18))
+        v3 = float(params.get('v3', 12))
+
+        variables = ['I1', 'I2', 'I3']
+        A = [
+            [r1 + rm + 1, -rm, 0],
+            [-rm, r2 + (2 * rm) + 1, -rm],
+            [0, -rm, r3 + rm + 1],
+        ]
+        b = [v1, v2, v3]
+        title = 'Electrical Circuit Solver (Mesh Currents)'
+
+    elif domain == 'structural':
+        w = float(params.get('w', 120))
+        xbar = float(params.get('xbar', 4))
+        l1 = float(params.get('l1', 3))
+        l2 = float(params.get('l2', 8))
+        ka = float(params.get('ka', 2.0))
+        kb = float(params.get('kb', 1.6))
+        kc = float(params.get('kc', 1.2))
+        lateral = float(params.get('lateral', 18))
+
+        variables = ['RA', 'RB', 'RC']
+        A = [
+            [1, 1, 1],
+            [0, l1, l2],
+            [ka + 1, -(kb + 0.5), kc + 1],
+        ]
+        b = [w, w * xbar, lateral]
+        title = 'Structural Engineering Load Reactions'
+
+    elif domain == 'economics':
+        d1 = float(params.get('d1', 130))
+        d2 = float(params.get('d2', 125))
+        d3 = float(params.get('d3', 120))
+        variables = ['P1', 'P2', 'P3']
+        A = [
+            [10, -2, -1],
+            [-1, 11, -2],
+            [-2, -1, 12],
+        ]
+        b = [d1, d2, d3]
+        title = 'Economics Equilibrium Model (Market Prices)'
+
+    elif domain == 'chemical':
+        c1 = float(params.get('c1', 42))
+        c2 = float(params.get('c2', 38))
+        c3 = float(params.get('c3', 30))
+        variables = ['A', 'B', 'C']
+        A = [
+            [9, -2, -1],
+            [-1, 10, -2],
+            [-2, -1, 9],
+        ]
+        b = [c1, c2, c3]
+        title = 'Chemical Balance System (Species Rates)'
+
+    else:
+        raise ValueError('Unknown domain model selected')
+
+    return A, b, variables, title
+
+
 # ────────────────────────────────────────────────
 # Web Routes
 # ────────────────────────────────────────────────
@@ -971,6 +1046,39 @@ HTML_TEMPLATE = '''
             color: #991b1b;
         }
 
+
+        .domain-card {
+            background: linear-gradient(135deg, #ecfeff 0%, #eef2ff 100%);
+            border: 1px solid #bae6fd;
+            border-radius: 12px;
+            padding: 16px;
+            margin-top: 12px;
+        }
+
+        .domain-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+            gap: 10px;
+            margin-top: 10px;
+        }
+
+        .domain-note {
+            margin-top: 10px;
+            color: #0f172a;
+            font-size: 13px;
+        }
+
+        .result-domain {
+            background: linear-gradient(135deg, #ede9fe 0%, #dbeafe 100%);
+            border: 1px solid #c4b5fd;
+            color: #3730a3;
+            border-radius: 10px;
+            padding: 10px 14px;
+            margin-top: 14px;
+            font-size: 13px;
+            font-weight: 700;
+        }
+
         .diagnostics-panel {
             margin-top: 16px;
             background: linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%);
@@ -1156,6 +1264,9 @@ HTML_TEMPLATE = '''
             <button class="mode-btn" onclick="setMode('equation')" id="equationBtn">
                 Equation Form
             </button>
+            <button class="mode-btn" onclick="setMode('domain')" id="domainBtn">
+                Domain Models
+            </button>
         </div>
 
         <div id="matrixMode" class="input-section">
@@ -1191,6 +1302,22 @@ HTML_TEMPLATE = '''
             </div>
         </div>
 
+        <div id="domainMode" class="input-section" style="display: none;">
+            <div class="form-group">
+                <label>Engineering/Science Model:</label>
+                <select id="domainType" onchange="generateDomainInputs()" style="width:100%;padding:11px 14px;border:2px solid #e5e7eb;border-radius:8px;font-size:14px;background:white;">
+                    <option value="electrical">Electrical Circuit Solver</option>
+                    <option value="structural">Structural Engineering Loads</option>
+                    <option value="economics">Economics Equilibrium Model</option>
+                    <option value="chemical">Chemical Balance Systems</option>
+                </select>
+            </div>
+            <div class="domain-card">
+                <div id="domainInputs" class="domain-grid"></div>
+                <div id="domainDescription" class="domain-note"></div>
+            </div>
+
+
         <div class="input-section" style="margin-top: 0;">
             <div class="form-group">
                 <label>Tolerance:</label>
@@ -1221,13 +1348,17 @@ HTML_TEMPLATE = '''
             currentMode = mode;
             document.getElementById('matrixBtn').classList.toggle('active', mode === 'matrix');
             document.getElementById('equationBtn').classList.toggle('active', mode === 'equation');
+            document.getElementById('domainBtn').classList.toggle('active', mode === 'domain');
             document.getElementById('matrixMode').style.display = mode === 'matrix' ? 'block' : 'none';
             document.getElementById('equationMode').style.display = mode === 'equation' ? 'block' : 'none';
+            document.getElementById('domainMode').style.display = mode === 'domain' ? 'block' : 'none';
             
             if (mode === 'matrix') {
                 generateMatrixInputs();
-            } else {
+            } else if (mode === 'equation') {
                 generateEquationInputs();
+            } else {
+                generateDomainInputs();
             }
         }
 
@@ -1306,6 +1437,62 @@ HTML_TEMPLATE = '''
             }
         }
 
+        function getDomainConfig(type) {
+            const configs = {
+                electrical: {
+                    description: 'Solve mesh currents from Kirchhoff voltage laws. Great for multi-loop circuit analysis.',
+                    fields: [
+                        ['r1', 'R1 (Ω)', 12], ['r2', 'R2 (Ω)', 10], ['r3', 'R3 (Ω)', 8],
+                        ['rm', 'Mutual Rm (Ω)', 2], ['v1', 'V1 (V)', 24], ['v2', 'V2 (V)', 18], ['v3', 'V3 (V)', 12],
+                    ],
+                },
+                structural: {
+                    description: 'Estimate support reactions using load balance + moment equilibrium + lateral compatibility.',
+                    fields: [
+                        ['w', 'Total Load W (kN)', 120], ['xbar', 'Centroid x̄ (m)', 4], ['l1', 'L1 (m)', 3], ['l2', 'L2 (m)', 8],
+                        ['ka', 'Stiffness kA', 2.0], ['kb', 'Stiffness kB', 1.6], ['kc', 'Stiffness kC', 1.2], ['lateral', 'Lateral eq. term', 18],
+                    ],
+                },
+                economics: {
+                    description: 'Find market equilibrium prices for three interdependent sectors from linearized demand-supply equations.',
+                    fields: [
+                        ['d1', 'Demand Constant D1', 130], ['d2', 'Demand Constant D2', 125], ['d3', 'Demand Constant D3', 120],
+                    ],
+                },
+                chemical: {
+                    description: 'Balance three species rates under coupled reaction constraints (steady-state approximation).',
+                    fields: [
+                        ['c1', 'Constraint C1', 42], ['c2', 'Constraint C2', 38], ['c3', 'Constraint C3', 30],
+                    ],
+                },
+            };
+            return configs[type] || configs.electrical;
+        }
+
+        function generateDomainInputs() {
+            const type = document.getElementById('domainType').value;
+            const config = getDomainConfig(type);
+            const container = document.getElementById('domainInputs');
+            const description = document.getElementById('domainDescription');
+            container.innerHTML = '';
+            description.textContent = config.description;
+
+            for (const [name, label, val] of config.fields) {
+                const wrap = document.createElement('div');
+                const l = document.createElement('label');
+                l.textContent = label;
+                l.style.marginBottom = '6px';
+                const input = document.createElement('input');
+                input.type = 'number';
+                input.step = 'any';
+                input.id = `domain_${name}`;
+                input.value = val;
+                wrap.appendChild(l);
+                wrap.appendChild(input);
+                container.appendChild(wrap);
+            }
+        }
+
         async function solve() {
             const resultsDiv = document.getElementById('results');
             const solveBtn = document.querySelector('.solve-btn');
@@ -1345,7 +1532,7 @@ HTML_TEMPLATE = '''
 
                     requestData.A = A;
                     requestData.b = b;
-                } else {
+                } else if (currentMode === 'equation') {
                     const n = parseInt(document.getElementById('numEquations').value);
                     const equations = [];
 
@@ -1356,6 +1543,17 @@ HTML_TEMPLATE = '''
                     }
 
                     requestData.equations = equations;
+                } else {
+                    const domainType = document.getElementById('domainType').value;
+                    const config = getDomainConfig(domainType);
+                    const params = {};
+                    for (const [name] of config.fields) {
+                        const val = parseFloat(document.getElementById(`domain_${name}`).value);
+                        if (isNaN(val)) throw new Error(`Invalid domain value: ${name}`);
+                        params[name] = val;
+                    }
+                    requestData.domainType = domainType;
+                    requestData.domainParams = params;
                 }
 
                 const response = await fetch('/solve', {
@@ -1462,6 +1660,10 @@ HTML_TEMPLATE = '''
 
             html += '</div>';
 
+            if (result.domainTitle) {
+                html += `<div class="result-domain">🚀 Domain Solver: ${result.domainTitle}</div>`;
+            }
+
             if (result.diagnostics) {
                 const d = result.diagnostics;
                 const stabilityText = {
@@ -1513,6 +1715,7 @@ HTML_TEMPLATE = '''
 
         // Initialize
         generateMatrixInputs();
+        generateDomainInputs();
     </script>
 </body>
 </html>
@@ -1565,6 +1768,16 @@ def solve():
                 b.append(const)
             input_payload = {'equations': equations}
         
+
+        elif mode == 'domain':
+            domain_type = data.get('domainType')
+            domain_params = data.get('domainParams', {})
+            A, b, variables, domain_title = build_domain_system(domain_type, domain_params)
+            input_payload = {
+                'domainType': domain_type,
+                'domainParams': domain_params,
+            }
+
         else:
             return jsonify({'error': 'Invalid mode'}), 400
 
@@ -1575,6 +1788,8 @@ def solve():
         result = gauss_seidel(A, b, variables, tol=tol, max_iter=max_iter)
         result['variables'] = variables
         result['diagnostics'] = analyze_system(A, b, result['solution'])
+        if mode == 'domain':
+            result['domainTitle'] = domain_title
 
         save_history_entry(
             {
