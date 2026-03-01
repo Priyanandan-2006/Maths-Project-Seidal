@@ -1079,6 +1079,36 @@ HTML_TEMPLATE = '''
             font-weight: 700;
         }
 
+
+        .explain-panel {
+            margin-top: 16px;
+            background: linear-gradient(135deg, #ecfeff 0%, #eef2ff 100%);
+            border: 1px solid #93c5fd;
+            border-radius: 12px;
+            padding: 16px;
+            color: #0f172a;
+        }
+
+        .explain-panel h3 {
+            color: #1e3a8a;
+            margin-bottom: 8px;
+            font-size: 16px;
+        }
+
+        .explain-panel ul {
+            margin-left: 18px;
+            margin-top: 8px;
+            font-size: 13px;
+            line-height: 1.6;
+        }
+
+        .explain-panel code {
+            background: #e0e7ff;
+            border-radius: 4px;
+            padding: 1px 6px;
+            font-size: 12px;
+        }
+
         .diagnostics-panel {
             margin-top: 16px;
             background: linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%);
@@ -1336,13 +1366,18 @@ HTML_TEMPLATE = '''
             <button class="secondary-btn" onclick="toggleHistory()">View History</button>
             <button class="secondary-btn clear-btn" onclick="clearHistoryRecords()">Clear History</button>
         </div>
+        <div style="margin-top:10px;">
+            <button class="secondary-btn" onclick="toggleExplanation()" style="width:100%;">📘 Explanation: How this was solved</button>
+        </div>
 
         <div id="results" style="display: none;"></div>
+        <div id="explanationPanel" class="explain-panel" style="display: none;"></div>
         <div id="historyPanel" class="history-panel" style="display: none;"></div>
     </div>
 
     <script>
         let currentMode = 'matrix';
+        let lastResult = null;
 
         function setMode(mode) {
             currentMode = mode;
@@ -1570,6 +1605,7 @@ HTML_TEMPLATE = '''
                     throw new Error(result.error);
                 }
 
+                lastResult = result;
                 displayResults(result);
                 await loadHistory();
 
@@ -1634,6 +1670,65 @@ HTML_TEMPLATE = '''
             if (historyPanel.style.display !== 'none') {
                 await loadHistory();
             }
+        }
+
+        function buildExplanationHtml(result) {
+            const domainText = result.domainTitle
+                ? `This run used the domain template: <code>${result.domainTitle}</code>.`
+                : 'This run used your direct matrix/equation inputs.';
+
+            const firstLogged = (result.iterations && result.iterations.length > 0) ? result.iterations[0] : null;
+            let firstIterHtml = '';
+            if (firstLogged) {
+                const samples = firstLogged.details
+                    .map(d => `<li><code>${d.variable}</code> updated to <code>${Number(d.value).toFixed(6)}</code> (Δ=${Number(d.delta).toExponential(2)})</li>`)
+                    .join('');
+                firstIterHtml = `<p><strong>First logged iteration (Iteration ${firstLogged.number}):</strong></p><ul>${samples}</ul>`;
+            }
+
+            const diagnostics = result.diagnostics || {};
+            const stability = diagnostics.stability ? diagnostics.stability.toUpperCase() : 'N/A';
+            const residual = diagnostics.residualInfinityNorm !== undefined
+                ? Number(diagnostics.residualInfinityNorm).toExponential(3)
+                : 'N/A';
+
+            return `
+                <h3>How to do it (Gauss-Seidel method)</h3>
+                <ul>
+                    <li>Start with an initial guess for all unknowns (this app uses 0 for each variable).</li>
+                    <li>Rearrange each equation in iterative form and update each variable sequentially.</li>
+                    <li>After each full pass, compute max change <code>max |xᵢ(new)-xᵢ(old)|</code>.</li>
+                    <li>Stop when max change is below tolerance or when max iterations is reached.</li>
+                </ul>
+                <p>${domainText}</p>
+                ${firstIterHtml}
+                <p><strong>Convergence summary:</strong> ${result.converged ? 'Converged' : 'Not converged'} in ${result.iterCount} iterations.</p>
+                <p><strong>Diagnostics summary:</strong> Stability <code>${stability}</code>, residual norm <code>${residual}</code>.</p>
+            `;
+        }
+
+        function toggleExplanation() {
+            const panel = document.getElementById('explanationPanel');
+            const show = panel.style.display === 'none';
+            panel.style.display = show ? 'block' : 'none';
+
+            if (!show) return;
+
+            if (!lastResult) {
+                panel.innerHTML = `
+                    <h3>How to do it (Gauss-Seidel method)</h3>
+                    <p>Run a solve first, then click this button again to see a step-by-step explanation using your own result.</p>
+                    <ul>
+                        <li>Pick mode (Matrix, Equation, or Domain Model).</li>
+                        <li>Enter coefficients/constants and solver settings.</li>
+                        <li>Press <code>Compute Solution</code>.</li>
+                        <li>Open this explanation panel for a guided breakdown.</li>
+                    </ul>
+                `;
+                return;
+            }
+
+            panel.innerHTML = buildExplanationHtml(lastResult);
         }
 
         function displayResults(result) {
