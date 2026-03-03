@@ -1,6 +1,6 @@
 """
 Gauss-Seidel Solver Web Application
-Integrates the original Python solver with the HTML interface
+Integrates the original Python solver with the redesigned premium HTML interface.
 """
 
 from flask import Flask, render_template_string, request, jsonify
@@ -15,11 +15,13 @@ app = Flask(__name__)
 DB_PATH = 'solver_history.db'
 
 
+# ────────────────────────────────────────────────
+# Database helpers
+# ────────────────────────────────────────────────
+
 def init_db() -> None:
-    """Create local SQLite table for solve history."""
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            '''
+        conn.execute('''
             CREATE TABLE IF NOT EXISTS solve_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at TEXT NOT NULL,
@@ -33,72 +35,45 @@ def init_db() -> None:
                 solution TEXT NOT NULL,
                 diagnostics TEXT NOT NULL
             )
-            '''
-        )
+        ''')
         conn.commit()
 
 
 def save_history_entry(entry: dict, result: dict) -> None:
-    """Persist one successful solve call into the history table."""
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            '''
+        conn.execute('''
             INSERT INTO solve_history (
                 created_at, mode, tol, max_iter, variables, input_payload,
                 converged, iter_count, solution, diagnostics
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''',
-            (
-                datetime.utcnow().isoformat(timespec='seconds') + 'Z',
-                entry['mode'],
-                entry['tol'],
-                entry['maxIter'],
-                json.dumps(entry['variables']),
-                json.dumps(entry['input']),
-                int(result['converged']),
-                int(result['iterCount']),
-                json.dumps(result['solution']),
-                json.dumps(result.get('diagnostics', {})),
-            ),
-        )
+        ''', (
+            datetime.utcnow().isoformat(timespec='seconds') + 'Z',
+            entry['mode'], entry['tol'], entry['maxIter'],
+            json.dumps(entry['variables']), json.dumps(entry['input']),
+            int(result['converged']), int(result['iterCount']),
+            json.dumps(result['solution']), json.dumps(result.get('diagnostics', {})),
+        ))
         conn.commit()
 
 
 def fetch_history(limit: int = 20) -> list:
-    """Return latest solve history entries."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            '''
+        rows = conn.execute('''
             SELECT id, created_at, mode, tol, max_iter, variables, input_payload,
                    converged, iter_count, solution, diagnostics
-            FROM solve_history
-            ORDER BY id DESC
-            LIMIT ?
-            ''',
-            (limit,),
-        ).fetchall()
-
-    items = []
-    for row in rows:
-        items.append({
-            'id': row['id'],
-            'createdAt': row['created_at'],
-            'mode': row['mode'],
-            'tol': row['tol'],
-            'maxIter': row['max_iter'],
-            'variables': json.loads(row['variables']),
-            'input': json.loads(row['input_payload']),
-            'converged': bool(row['converged']),
-            'iterCount': row['iter_count'],
-            'solution': json.loads(row['solution']),
-            'diagnostics': json.loads(row['diagnostics']),
-        })
-    return items
+            FROM solve_history ORDER BY id DESC LIMIT ?
+        ''', (limit,)).fetchall()
+    return [{
+        'id': r['id'], 'createdAt': r['created_at'], 'mode': r['mode'],
+        'tol': r['tol'], 'maxIter': r['max_iter'],
+        'variables': json.loads(r['variables']), 'input': json.loads(r['input_payload']),
+        'converged': bool(r['converged']), 'iterCount': r['iter_count'],
+        'solution': json.loads(r['solution']), 'diagnostics': json.loads(r['diagnostics']),
+    } for r in rows]
 
 
 def clear_history() -> None:
-    """Delete all history entries."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute('DELETE FROM solve_history')
         conn.commit()
@@ -108,14 +83,13 @@ init_db()
 
 
 # ────────────────────────────────────────────────
-# Parse single equation → coefficients + constant
+# Solver core
 # ────────────────────────────────────────────────
+
 def parse_equation(eq: str, var_to_idx: dict) -> tuple:
-    """Parse an equation string into coefficients and constant"""
-    eq = eq.replace(" ", "")  # remove spaces
+    eq = eq.replace(" ", "")
     if "=" not in eq:
         raise ValueError("Equation must contain '='")
-
     left, right_str = eq.split("=", 1)
     try:
         rhs = float(right_str)
@@ -123,62 +97,44 @@ def parse_equation(eq: str, var_to_idx: dict) -> tuple:
         raise ValueError(f"Right-hand side is not a number: {right_str}")
 
     coeffs = [0.0] * len(var_to_idx)
-
-    # Pattern matches:  -, +, 2.5x, -3y, .4z, x, -x, +x, etc.
     pattern = r"([+-]?)(\d*\.?\d*)([a-zA-Z])|([+-])([a-zA-Z])"
     i = 0
-    implicit_sign = "+"  # first term is positive if no sign
+    implicit_sign = "+"
 
     while i < len(left):
         m = re.match(pattern, left[i:])
         if not m:
             i += 1
             continue
-
         sign_str, coeff_str, var, sign2, var2 = m.groups()
-
-        if var2:  # case: +x or -y
-            sign = sign2
-            coeff = 1.0
-            var = var2
+        if var2:
+            sign, coeff, var = sign2, 1.0, var2
         else:
             sign = sign_str if sign_str else implicit_sign
             coeff = float(coeff_str) if coeff_str and coeff_str != "." else 1.0
-            var = var
-
         if sign == "-":
             coeff = -coeff
-
         if var in var_to_idx:
             coeffs[var_to_idx[var]] = coeff
         else:
             raise ValueError(f"Unknown variable '{var}' in equation")
-
         i += m.end()
-        implicit_sign = "+"  # after first term
+        implicit_sign = "+"
 
     return coeffs, rhs
 
 
 def prepare_matrix(A, b):
-    """Validate and normalize matrix input"""
     n = len(A)
     if len(b) != n:
         raise ValueError("Length of b must match number of rows in A")
-
     for row in A:
         if len(row) != n:
             raise ValueError("Matrix A must be square")
-
-    # Convert to float
-    A = [[float(x) for x in row] for row in A]
-    b = [float(x) for x in b]
-
-    return A, b
+    return [[float(x) for x in row] for row in A], [float(x) for x in b]
 
 
 def gauss_seidel(A, b, variables, tol=1e-4, max_iter=1000):
-    """Gauss-Seidel iterative solver with detailed logging"""
     n = len(A)
     x = [0.0] * n
     iterations_log = []
@@ -186,52 +142,26 @@ def gauss_seidel(A, b, variables, tol=1e-4, max_iter=1000):
     for iteration in range(1, max_iter + 1):
         max_delta = 0.0
         details = []
-
         for i in range(n):
             old_xi = x[i]
             sum_other = sum(A[i][j] * x[j] for j in range(n) if j != i)
             x[i] = (b[i] - sum_other) / A[i][i]
-
             delta = abs(x[i] - old_xi)
             max_delta = max(max_delta, delta)
+            details.append({'variable': variables[i], 'value': x[i], 'delta': delta})
 
-            details.append({
-                'variable': variables[i],
-                'value': x[i],
-                'delta': delta
-            })
-
-        # Store iteration details (first 10 or every 20th)
         if iteration <= 10 or iteration % 20 == 0:
-            iterations_log.append({
-                'number': iteration,
-                'details': details,
-                'maxDelta': max_delta
-            })
+            iterations_log.append({'number': iteration, 'details': details, 'maxDelta': max_delta})
 
         if max_delta < tol:
-            return {
-                'converged': True,
-                'iterations': iterations_log,
-                'solution': x,
-                'iterCount': iteration
-            }
+            return {'converged': True, 'iterations': iterations_log, 'solution': x, 'iterCount': iteration}
 
-    return {
-        'converged': False,
-        'iterations': iterations_log,
-        'solution': x,
-        'iterCount': max_iter
-    }
+    return {'converged': False, 'iterations': iterations_log, 'solution': x, 'iterCount': max_iter}
 
 
 def analyze_system(A: list, b: list, x: list) -> dict:
-    """Return diagnostics that explain numerical stability and solution quality."""
     n = len(A)
-    row_metrics = []
-    min_margin = float('inf')
-    strict_rows = 0
-    weak_rows = 0
+    row_metrics, min_margin, strict_rows, weak_rows = [], float('inf'), 0, 0
 
     for i in range(n):
         diag = abs(A[i][i])
@@ -239,115 +169,63 @@ def analyze_system(A: list, b: list, x: list) -> dict:
         margin = diag - off_diag
         ratio = (diag / off_diag) if off_diag > 0 else float('inf')
         min_margin = min(min_margin, margin)
-
         if diag > off_diag:
-            strict_rows += 1
-            status = 'strict'
+            strict_rows += 1; status = 'strict'
         elif isclose(diag, off_diag, rel_tol=1e-12, abs_tol=1e-12):
-            weak_rows += 1
-            status = 'weak'
+            weak_rows += 1; status = 'weak'
         else:
             status = 'not_dominant'
+        row_metrics.append({'row': i+1, 'diagAbs': diag, 'offDiagAbs': off_diag,
+                             'margin': margin, 'ratio': ratio, 'status': status})
 
-        row_metrics.append({
-            'row': i + 1,
-            'diagAbs': diag,
-            'offDiagAbs': off_diag,
-            'margin': margin,
-            'ratio': ratio,
-            'status': status,
-        })
-
-    residual_vector = []
-    for i in range(n):
-        lhs = sum(A[i][j] * x[j] for j in range(n))
-        residual_vector.append(lhs - b[i])
-
+    residual_vector = [sum(A[i][j] * x[j] for j in range(n)) - b[i] for i in range(n)]
     inf_norm = max(abs(r) for r in residual_vector) if residual_vector else 0.0
 
-    if strict_rows == n:
-        stability = 'excellent'
-    elif strict_rows + weak_rows == n:
-        stability = 'fair'
-    else:
-        stability = 'risky'
+    if strict_rows == n:        stability = 'excellent'
+    elif strict_rows + weak_rows == n: stability = 'fair'
+    else:                       stability = 'risky'
 
     return {
-        'rowMetrics': row_metrics,
-        'strictDominantRows': strict_rows,
-        'weakDominantRows': weak_rows,
-        'minimumMargin': min_margin,
-        'residualVector': residual_vector,
-        'residualInfinityNorm': inf_norm,
+        'rowMetrics': row_metrics, 'strictDominantRows': strict_rows,
+        'weakDominantRows': weak_rows, 'minimumMargin': min_margin,
+        'residualVector': residual_vector, 'residualInfinityNorm': inf_norm,
         'stability': stability,
     }
 
 
 def build_domain_system(domain: str, params: dict) -> tuple:
-    """Build domain-specific linear systems to solve with Gauss-Seidel."""
     domain = (domain or '').strip().lower()
 
     if domain == 'electrical':
-        r1 = float(params.get('r1', 12))
-        r2 = float(params.get('r2', 10))
-        r3 = float(params.get('r3', 8))
-        rm = float(params.get('rm', 2))
-        v1 = float(params.get('v1', 24))
-        v2 = float(params.get('v2', 18))
-        v3 = float(params.get('v3', 12))
-
-        variables = ['I1', 'I2', 'I3']
-        A = [
-            [r1 + rm + 1, -rm, 0],
-            [-rm, r2 + (2 * rm) + 1, -rm],
-            [0, -rm, r3 + rm + 1],
-        ]
-        b = [v1, v2, v3]
+        r1,r2,r3,rm = float(params.get('r1',12)), float(params.get('r2',10)), float(params.get('r3',8)), float(params.get('rm',2))
+        v1,v2,v3    = float(params.get('v1',24)), float(params.get('v2',18)), float(params.get('v3',12))
+        variables = ['I1','I2','I3']
+        A = [[r1+rm+1,-rm,0],[-rm,r2+(2*rm)+1,-rm],[0,-rm,r3+rm+1]]
+        b = [v1,v2,v3]
         title = 'Electrical Circuit Solver (Mesh Currents)'
 
     elif domain == 'structural':
-        w = float(params.get('w', 120))
-        xbar = float(params.get('xbar', 4))
-        l1 = float(params.get('l1', 3))
-        l2 = float(params.get('l2', 8))
-        ka = float(params.get('ka', 2.0))
-        kb = float(params.get('kb', 1.6))
-        kc = float(params.get('kc', 1.2))
-        lateral = float(params.get('lateral', 18))
-
-        variables = ['RA', 'RB', 'RC']
-        A = [
-            [1, 1, 1],
-            [0, l1, l2],
-            [ka + 1, -(kb + 0.5), kc + 1],
-        ]
-        b = [w, w * xbar, lateral]
+        w,xbar  = float(params.get('w',120)), float(params.get('xbar',4))
+        l1,l2   = float(params.get('l1',3)),  float(params.get('l2',8))
+        ka,kb,kc = float(params.get('ka',2.0)), float(params.get('kb',1.6)), float(params.get('kc',1.2))
+        lateral = float(params.get('lateral',18))
+        variables = ['RA','RB','RC']
+        A = [[1,1,1],[0,l1,l2],[ka+1,-(kb+0.5),kc+1]]
+        b = [w, w*xbar, lateral]
         title = 'Structural Engineering Load Reactions'
 
     elif domain == 'economics':
-        d1 = float(params.get('d1', 130))
-        d2 = float(params.get('d2', 125))
-        d3 = float(params.get('d3', 120))
-        variables = ['P1', 'P2', 'P3']
-        A = [
-            [10, -2, -1],
-            [-1, 11, -2],
-            [-2, -1, 12],
-        ]
-        b = [d1, d2, d3]
+        d1,d2,d3 = float(params.get('d1',130)), float(params.get('d2',125)), float(params.get('d3',120))
+        variables = ['P1','P2','P3']
+        A = [[10,-2,-1],[-1,11,-2],[-2,-1,12]]
+        b = [d1,d2,d3]
         title = 'Economics Equilibrium Model (Market Prices)'
 
     elif domain == 'chemical':
-        c1 = float(params.get('c1', 42))
-        c2 = float(params.get('c2', 38))
-        c3 = float(params.get('c3', 30))
-        variables = ['A', 'B', 'C']
-        A = [
-            [9, -2, -1],
-            [-1, 10, -2],
-            [-2, -1, 9],
-        ]
-        b = [c1, c2, c3]
+        c1,c2,c3 = float(params.get('c1',42)), float(params.get('c2',38)), float(params.get('c3',30))
+        variables = ['A','B','C']
+        A = [[9,-2,-1],[-1,10,-2],[-2,-1,9]]
+        b = [c1,c2,c3]
         title = 'Chemical Balance System (Species Rates)'
 
     else:
@@ -357,1303 +235,725 @@ def build_domain_system(domain: str, params: dict) -> tuple:
 
 
 # ────────────────────────────────────────────────
-# Web Routes
+# Redesigned Premium HTML Template
 # ────────────────────────────────────────────────
 
-HTML_TEMPLATE = '''
-<!DOCTYPE html>
+HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Gauss-Seidel Solver</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
-            background: radial-gradient(circle at top left, #7c3aed 0%, transparent 45%),
-                        radial-gradient(circle at 85% 15%, #0ea5e9 0%, transparent 35%),
-                        linear-gradient(135deg, #1e1b4b 0%, #312e81 45%, #4c1d95 100%);
-            min-height: 100vh;
-            padding: 40px 20px;
-            display: flex;
-            justify-content: center;
-            align-items: flex-start;
-            position: relative;
-        }
-
-        body::before {
-            content: '';
-            position: fixed;
-            inset: 0;
-            background-image: linear-gradient(rgba(255,255,255,0.05) 1px, transparent 1px),
-                              linear-gradient(90deg, rgba(255,255,255,0.05) 1px, transparent 1px);
-            background-size: 30px 30px;
-            mask-image: radial-gradient(circle at center, black, transparent 85%);
-            pointer-events: none;
-        }
-
-        .container {
-            background: linear-gradient(145deg, rgba(255,255,255,0.9), rgba(224,231,255,0.85));
-            backdrop-filter: blur(12px);
-            border-radius: 22px;
-            box-shadow: 0 30px 70px rgba(15, 23, 42, 0.45), 0 0 0 1px rgba(129,140,248,0.35), 0 0 40px rgba(56,189,248,0.2);
-            max-width: 1100px;
-            width: 100%;
-            padding: 48px;
-            animation: slideIn 0.4s ease-out;
-            position: relative;
-            z-index: 2;
-            border: 1px solid rgba(255, 255, 255, 0.8);
-            overflow: hidden;
-        }
-
-        @keyframes slideIn {
-            from {
-                opacity: 0;
-                transform: translateY(-20px);
-            }
-            to {
-                opacity: 1;
-                transform: translateY(0);
-            }
-        }
-
-        .header {
-            margin-bottom: 28px;
-            padding: 28px;
-            border-radius: 18px;
-            background: linear-gradient(135deg, #312e81 0%, #5b21b6 52%, #0284c7 100%);
-            box-shadow: 0 12px 28px rgba(49, 46, 129, 0.35);
-            color: white;
-            position: relative;
-            overflow: hidden;
-        }
-
-        .header::after {
-            content: '';
-            position: absolute;
-            inset: 0;
-            background: radial-gradient(circle at 80% 20%, rgba(255,255,255,0.25), transparent 50%);
-            pointer-events: none;
-        }
-
-        h1 {
-            color: #ffffff;
-            font-size: 34px;
-            font-weight: 800;
-            margin-bottom: 8px;
-            letter-spacing: -0.6px;
-            text-shadow: 0 4px 20px rgba(15, 23, 42, 0.25);
-        }
-
-        .subtitle {
-            color: rgba(255,255,255,0.92);
-            font-size: 14px;
-            font-weight: 500;
-            max-width: 640px;
-        }
-
-        .hero-tags {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-            margin-top: 16px;
-            position: relative;
-            z-index: 1;
-        }
-
-        .hero-tag {
-            border: 1px solid rgba(255,255,255,0.45);
-            color: white;
-            background: rgba(255,255,255,0.14);
-            border-radius: 999px;
-            padding: 6px 12px;
-            font-size: 12px;
-            font-weight: 700;
-            backdrop-filter: blur(3px);
-            letter-spacing: 0.2px;
-        }
-
-        .mode-selector {
-            display: inline-flex;
-            background: #eef2ff;
-            border-radius: 12px;
-            padding: 5px;
-            margin-bottom: 26px;
-            box-shadow: inset 0 2px 6px rgba(79, 70, 229, 0.15);
-            border: 1px solid #c7d2fe;
-        }
-
-        .mode-btn {
-            padding: 12px 28px;
-            border: none;
-            background: transparent;
-            color: #6b7280;
-            border-radius: 8px;
-            cursor: pointer;
-            font-size: 14px;
-            font-weight: 600;
-            transition: all 0.3s ease;
-            position: relative;
-        }
-
-        .mode-btn:hover:not(.active) {
-            color: #111827;
-            background: rgba(255, 255, 255, 0.5);
-        }
-
-        .mode-btn.active {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4), 0 2px 4px rgba(102, 126, 234, 0.2);
-            transform: translateY(-1px);
-        }
-
-        .input-section {
-            background: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
-            border: 1px solid #dbeafe;
-            position: relative;
-            padding: 28px;
-            border-radius: 14px;
-            margin-bottom: 24px;
-            animation: expandIn 0.3s ease-out;
-            box-shadow: 0 10px 24px rgba(37, 99, 235, 0.08);
-        }
-
-        .input-section::before {
-            content: '';
-            position: absolute;
-            inset: 0;
-            border-radius: 14px;
-            border: 1px solid rgba(99, 102, 241, 0.15);
-            pointer-events: none;
-        }
-
-        @keyframes expandIn {
-            from {
-                opacity: 0;
-                transform: scaleY(0.95);
-            }
-            to {
-                opacity: 1;
-                transform: scaleY(1);
-            }
-        }
-
-        .form-group {
-            margin-bottom: 24px;
-        }
-
-        .form-group:last-child {
-            margin-bottom: 0;
-        }
-
-        label {
-            display: block;
-            margin-bottom: 10px;
-            font-weight: 600;
-            color: #1f2937;
-        }
-
-        input, select {
-            width: 100%;
-            padding: 12px 14px;
-            border: 2px solid #e5e7eb;
-            border-radius: 8px;
-            font-size: 15px;
-            transition: all 0.2s;
-        }
-
-        input:focus, select:focus {
-            outline: none;
-            border-color: #6366f1;
-            box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.1);
-        }
-
-        .matrix-input {
-            display: flex;
-            flex-direction: column;
-            gap: 8px;
-        }
-
-        .matrix-row {
-            display: flex;
-            gap: 8px;
-        }
-
-        .matrix-row input {
-            flex: 1;
-            text-align: center;
-        }
-
-        .equation-input {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            margin-bottom: 12px;
-        }
-
-        .equation-number {
-            width: 32px;
-            height: 32px;
-            background: #6366f1;
-            color: white;
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-weight: bold;
-            flex-shrink: 0;
-        }
-
-        .equation-input input {
-            flex: 1;
-        }
-
-        .info-box {
-            background: rgba(99, 102, 241, 0.08);
-            border: 1px solid rgba(99, 102, 241, 0.2);
-            padding: 16px;
-            border-radius: 10px;
-            margin-top: 16px;
-            font-size: 14px;
-            line-height: 1.5;
-        }
-
-        .solve-btn {
-            width: 100%;
-            padding: 16px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            border: none;
-            border-radius: 12px;
-            font-size: 18px;
-            font-weight: 700;
-            cursor: pointer;
-            transition: all 0.3s ease;
-            box-shadow: 0 6px 20px rgba(102, 126, 234, 0.3);
-            margin: 20px 0;
-        }
-
-        .solve-btn:hover:not(:disabled) {
-            background: linear-gradient(135deg, #764ba2 0%, #667eea 100%);
-            box-shadow: 0 6px 24px rgba(102, 126, 234, 0.5);
-            transform: translateY(-2px);
-        }
-
-        .solve-btn:active:not(:disabled) {
-            transform: translateY(0);
-            box-shadow: 0 2px 8px rgba(102, 126, 234, 0.4);
-        }
-
-        .solve-btn:disabled {
-            opacity: 0.6;
-            cursor: not-allowed;
-        }
-
-        .results {
-            margin-top: 32px;
-            animation: slideIn 0.4s ease-out;
-        }
-
-        .results-header {
-            background: linear-gradient(135deg, #3730a3 0%, #7c3aed 60%, #0284c7 100%);
-            color: white;
-            padding: 18px 24px;
-            border-radius: 12px 12px 0 0;
-            font-size: 16px;
-            font-weight: 700;
-            letter-spacing: 0.5px;
-            box-shadow: 0 8px 20px rgba(67, 56, 202, 0.35);
-        }
-
-        .results-content {
-            background: white;
-            border: 2px solid #e5e7eb;
-            border-top: none;
-            padding: 24px;
-            border-radius: 0 0 10px 10px;
-            max-height: 500px;
-            overflow-y: auto;
-        }
-
-        .results-content::-webkit-scrollbar {
-            width: 10px;
-        }
-
-        .results-content::-webkit-scrollbar-track {
-            background: linear-gradient(180deg, #f3f4f6 0%, #e5e7eb 100%);
-            border-radius: 5px;
-        }
-
-        .results-content::-webkit-scrollbar-thumb {
-            background: linear-gradient(180deg, #667eea 0%, #764ba2 100%);
-            border-radius: 5px;
-        }
-
-        .iteration-block {
-            margin-bottom: 24px;
-            padding: 16px;
-            background: #f8fafc;
-            border-radius: 10px;
-            border: 1px solid #e5e7eb;
-        }
-
-        .iteration-header {
-            font-weight: 700;
-            color: #1e40af;
-            margin-bottom: 12px;
-            font-size: 16px;
-        }
-
-        .variable-value {
-            display: flex;
-            justify-content: space-between;
-            margin-bottom: 8px;
-            font-family: 'SF Mono', Monaco, Consolas, monospace;
-        }
-
-        .variable-name {
-            color: #1e3a8a;
-            font-weight: 600;
-        }
-
-        .variable-number {
-            color: #059669;
-            font-weight: 700;
-        }
-
-        .delta {
-            color: #dc2626;
-            font-size: 0.9em;
-        }
-
-        .max-change {
-            margin-top: 12px;
-            padding-top: 12px;
-            border-top: 1px dashed #cbd5e1;
-            font-weight: 600;
-            color: #7c3aed;
-        }
-
-        .final-solution {
-            margin-top: 32px;
-            padding: 24px;
-            background: linear-gradient(135deg, #ecfdf5 0%, #d1fae5 100%);
-            border: 2px solid #6ee7b7;
-            border-radius: 12px;
-        }
-
-        .final-solution h3 {
-            color: #065f46;
-            margin-bottom: 16px;
-        }
-
-        .solution-item {
-            display: flex;
-            justify-content: space-between;
-            padding: 12px 0;
-            border-bottom: 1px solid #a7f3d0;
-            font-size: 18px;
-            font-weight: 600;
-        }
-
-        .solution-item:last-child {
-            border-bottom: none;
-        }
-
-        .error-message {
-            background: #fee2e2;
-            color: #991b1b;
-            padding: 16px;
-            border-radius: 10px;
-            margin-top: 20px;
-            border: 1px solid #fecaca;
-        }
-
-        .badge {
-            display: inline-block;
-            padding: 6px 14px;
-            background: rgba(255, 255, 255, 0.25);
-            backdrop-filter: blur(10px);
-            color: white;
-            border-radius: 20px;
-            font-size: 12px;
-            font-weight: 700;
-            margin-left: 12px;
-            border: 1px solid rgba(255, 255, 255, 0.3);
-            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
-        }
-
-        .action-row {
-            display: grid;
-            grid-template-columns: 1fr 180px 180px;
-            gap: 10px;
-            margin-top: 6px;
-        }
-
-        .secondary-btn {
-            padding: 14px;
-            border: none;
-            border-radius: 10px;
-            font-size: 14px;
-            font-weight: 700;
-            cursor: pointer;
-            transition: all 0.2s ease;
-            color: #1f2937;
-            background: linear-gradient(135deg, #e5e7eb 0%, #d1d5db 100%);
-        }
-
-        .secondary-btn:hover {
-            transform: translateY(-1px);
-            box-shadow: 0 6px 16px rgba(17, 24, 39, 0.15);
-        }
-
-        .clear-btn {
-            background: linear-gradient(135deg, #fee2e2 0%, #fecaca 100%);
-            color: #7f1d1d;
-        }
-
-        .history-panel {
-            margin-top: 20px;
-            background: linear-gradient(135deg, #eef2ff 0%, #f0f9ff 100%);
-            border: 1px solid #bfdbfe;
-            border-radius: 14px;
-            padding: 18px;
-            box-shadow: 0 8px 24px rgba(14, 116, 144, 0.12);
-        }
-
-        .history-item {
-            border: 1px solid #c7d2fe;
-            background: white;
-            border-radius: 12px;
-            padding: 14px;
-            margin-bottom: 10px;
-            font-size: 13px;
-            color: #1f2937;
-            box-shadow: 0 4px 14px rgba(99, 102, 241, 0.08);
-        }
-
-        .history-item:last-child {
-            margin-bottom: 0;
-        }
-
-        .history-title {
-            font-weight: 800;
-            color: #312e81;
-            margin-bottom: 10px;
-            font-size: 15px;
-            letter-spacing: 0.3px;
-        }
-
-        .history-meta {
-            font-family: 'SF Mono', Monaco, Consolas, monospace;
-            color: #374151;
-            margin-bottom: 6px;
-        }
-
-        .history-status {
-            display: inline-block;
-            margin-top: 6px;
-            padding: 4px 10px;
-            border-radius: 999px;
-            font-size: 11px;
-            font-weight: 700;
-            letter-spacing: 0.2px;
-            text-transform: uppercase;
-        }
-
-        .history-status.ok {
-            background: #dcfce7;
-            color: #166534;
-        }
-
-        .history-status.warn {
-            background: #fee2e2;
-            color: #991b1b;
-        }
-
-        .domain-card {
-            background: linear-gradient(135deg, #ecfeff 0%, #eef2ff 100%);
-            border: 1px solid #bae6fd;
-            border-radius: 12px;
-            padding: 16px;
-            margin-top: 12px;
-        }
-
-        .domain-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-            gap: 10px;
-            margin-top: 10px;
-        }
-
-        .domain-note {
-            margin-top: 10px;
-            color: #0f172a;
-            font-size: 13px;
-        }
-
-        .result-domain {
-            background: linear-gradient(135deg, #ede9fe 0%, #dbeafe 100%);
-            border: 1px solid #c4b5fd;
-            color: #3730a3;
-            border-radius: 10px;
-            padding: 10px 14px;
-            margin-top: 14px;
-            font-size: 13px;
-            font-weight: 700;
-        }
-
-        .explain-panel {
-            margin-top: 16px;
-            background: linear-gradient(135deg, #ecfeff 0%, #eef2ff 100%);
-            border: 1px solid #93c5fd;
-            border-radius: 12px;
-            padding: 16px;
-            color: #0f172a;
-        }
-
-        .explain-panel h3 {
-            color: #1e3a8a;
-            margin-bottom: 8px;
-            font-size: 16px;
-        }
-
-        .explain-panel ul {
-            margin-left: 18px;
-            margin-top: 8px;
-            font-size: 13px;
-            line-height: 1.6;
-        }
-
-        .explain-panel code {
-            background: #e0e7ff;
-            border-radius: 4px;
-            padding: 1px 6px;
-            font-size: 12px;
-        }
-
-        .diagnostics-panel {
-            margin-top: 16px;
-            background: linear-gradient(135deg, #fffbeb 0%, #fef3c7 100%);
-            border: 2px solid #fcd34d;
-            border-radius: 12px;
-            padding: 20px;
-        }
-
-        .diagnostics-panel h3 {
-            color: #92400e;
-            margin-bottom: 10px;
-            font-size: 16px;
-        }
-
-        .diagnostics-panel p {
-            color: #78350f;
-            font-size: 13px;
-            margin-bottom: 8px;
-        }
-
-        .diagnostics-table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 10px;
-            font-family: 'SF Mono', Monaco, Consolas, monospace;
-            font-size: 12px;
-            background: white;
-            border-radius: 8px;
-            overflow: hidden;
-        }
-
-        .diagnostics-table th,
-        .diagnostics-table td {
-            border: 1px solid #fde68a;
-            padding: 8px;
-            text-align: center;
-        }
-
-        .diagnostics-table th {
-            background: #fef3c7;
-            color: #78350f;
-            font-weight: 700;
-        }
-
-        .status-pill {
-            display: inline-block;
-            padding: 2px 8px;
-            border-radius: 999px;
-            font-size: 11px;
-            font-weight: 700;
-            text-transform: uppercase;
-        }
-
-        .status-strict {
-            background: #dcfce7;
-            color: #166534;
-        }
-
-        .status-weak {
-            background: #fef3c7;
-            color: #92400e;
-        }
-
-        .status-not_dominant {
-            background: #fee2e2;
-            color: #991b1b;
-        }
-
-        .math-sky {
-            position: fixed;
-            inset: 0;
-            pointer-events: none;
-            z-index: 0;
-            overflow: hidden;
-        }
-
-        .math-symbol {
-            position: absolute;
-            color: rgba(255,255,255,0.8);
-            font-weight: 800;
-            text-shadow: 0 0 16px rgba(147,197,253,0.9);
-            animation: floatMath var(--dur, 16s) linear infinite;
-            animation-delay: var(--delay, 0s);
-            transform: translateY(120vh) rotate(0deg);
-            user-select: none;
-        }
-
-        @keyframes floatMath {
-            0% {
-                transform: translateY(115vh) translateX(0) rotate(0deg) scale(0.9);
-                opacity: 0;
-            }
-            10% { opacity: 0.85; }
-            50% {
-                transform: translateY(50vh) translateX(20px) rotate(180deg) scale(1.05);
-            }
-            100% {
-                transform: translateY(-20vh) translateX(-14px) rotate(360deg) scale(0.9);
-                opacity: 0;
-            }
-        }
-
-        .header::before {
-            content: '🤖 solving equations in hyperspace...';
-            position: absolute;
-            right: 18px;
-            bottom: 12px;
-            font-size: 12px;
-            font-weight: 700;
-            color: rgba(255,255,255,0.9);
-            background: rgba(15,23,42,0.28);
-            border: 1px solid rgba(255,255,255,0.35);
-            border-radius: 999px;
-            padding: 6px 12px;
-            animation: pulseTag 1.8s ease-in-out infinite;
-        }
-
-        @keyframes pulseTag {
-            0%, 100% { transform: scale(1); opacity: 0.8; }
-            50% { transform: scale(1.04); opacity: 1; }
-        }
-
-        @media (max-width: 768px) {
-            body {
-                padding: 20px 16px;
-            }
-
-            .container {
-                padding: 28px 24px;
-            }
-
-            h1 {
-                font-size: 24px;
-            }
-
-            .mode-selector {
-                width: 100%;
-            }
-
-            .mode-btn {
-                flex: 1;
-            }
-
-            .action-row {
-                grid-template-columns: 1fr;
-            }
-
-            .header::before {
-                position: static;
-                display: inline-block;
-                margin-top: 10px;
-            }
-        }
-    </style>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>GaussSolve &mdash; Iterative Linear System Solver</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&family=Nunito:wght@400;600;700;800&display=swap" rel="stylesheet"/>
+<style>
+:root{
+  --bg:#F8F7F4;--surface:#FFFFFF;--surface2:#F2F1EE;
+  --border:#E8E6E1;--border2:#D4D0C8;
+  --ink:#1A1916;--ink2:#4A4740;--ink3:#8A8680;
+  --accent:#2563EB;--accent-lt:#EEF4FF;--accent2:#7C3AED;
+  --success:#059669;--success-lt:#ECFDF5;
+  --warn:#D97706;--warn-lt:#FFFBEB;--danger:#DC2626;
+  --r-md:14px;--r-lg:20px;--r-xl:28px;
+  --shadow-sm:0 1px 3px rgba(0,0,0,.06),0 1px 2px rgba(0,0,0,.04);
+  --shadow-md:0 4px 16px rgba(0,0,0,.08),0 1px 4px rgba(0,0,0,.04);
+  --shadow-lg:0 12px 40px rgba(0,0,0,.10),0 2px 8px rgba(0,0,0,.05);
+  --font-sans:'Sora',sans-serif;--font-mono:'JetBrains Mono',monospace;--font-fun:'Nunito',sans-serif;
+  --ease-spring:cubic-bezier(.34,1.56,.64,1);--ease-smooth:cubic-bezier(.25,.46,.45,.94);
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{font-family:var(--font-sans);background:var(--bg);color:var(--ink);font-size:15px;line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+::selection{background:#BFDBFE;color:var(--ink)}
+a{color:inherit;text-decoration:none}
+button{cursor:pointer;border:none;background:none;font-family:inherit}
+input,select,textarea{font-family:inherit}
+::-webkit-scrollbar{width:6px}
+::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:var(--border2);border-radius:99px}
+
+/* NAVBAR */
+.navbar{position:fixed;top:0;left:0;right:0;z-index:100;display:flex;align-items:center;justify-content:space-between;padding:0 40px;height:64px;background:rgba(248,247,244,.88);backdrop-filter:blur(16px);border-bottom:1px solid var(--border);transition:box-shadow .3s}
+.navbar.scrolled{box-shadow:var(--shadow-md)}
+.nav-logo{display:flex;align-items:center;gap:10px;font-weight:700;font-size:17px;letter-spacing:-.3px}
+.nav-logo-icon{width:32px;height:32px;border-radius:8px;background:linear-gradient(135deg,var(--accent),var(--accent2));display:flex;align-items:center;justify-content:center;font-family:var(--font-fun);font-weight:800;font-size:14px;color:#fff}
+.nav-links{display:flex;align-items:center;gap:32px}
+.nav-links a{font-size:14px;font-weight:500;color:var(--ink2);transition:color .2s}
+.nav-links a:hover{color:var(--ink)}
+.nav-cta{padding:8px 20px;border-radius:99px;background:var(--ink);color:#fff;font-size:13px;font-weight:600;transition:background .2s,transform .15s var(--ease-spring),box-shadow .2s;box-shadow:0 2px 8px rgba(0,0,0,.15)}
+.nav-cta:hover{background:#2d2b27;transform:translateY(-1px);box-shadow:0 4px 16px rgba(0,0,0,.2)}
+
+/* HERO */
+.hero{min-height:100vh;display:flex;align-items:center;padding:120px 40px 80px;position:relative;overflow:hidden}
+.hero-bg{position:absolute;inset:0;z-index:0;background:radial-gradient(ellipse 70% 60% at 60% 50%,rgba(37,99,235,.06) 0%,transparent 70%),radial-gradient(ellipse 50% 40% at 20% 80%,rgba(124,58,237,.05) 0%,transparent 70%)}
+.hero-grid{position:absolute;inset:0;background-image:linear-gradient(var(--border) 1px,transparent 1px),linear-gradient(90deg,var(--border) 1px,transparent 1px);background-size:60px 60px;opacity:.4;mask-image:radial-gradient(ellipse 80% 80% at 50% 50%,black 30%,transparent 80%)}
+.hero-inner{max-width:1100px;margin:0 auto;width:100%;display:grid;grid-template-columns:1fr 1fr;gap:80px;align-items:center;position:relative;z-index:1}
+.hero-badge{display:inline-flex;align-items:center;gap:8px;padding:6px 14px;border-radius:99px;background:var(--accent-lt);border:1px solid #BFDBFE;font-size:12px;font-weight:600;color:var(--accent);letter-spacing:.02em;text-transform:uppercase;margin-bottom:24px;animation:fadeInUp .6s var(--ease-smooth) both}
+.hero-badge-dot{width:6px;height:6px;border-radius:50%;background:var(--accent);animation:pulse-dot 2s infinite}
+@keyframes pulse-dot{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.6;transform:scale(.7)}}
+.hero-title{font-size:clamp(36px,5vw,58px);font-weight:800;letter-spacing:-.03em;line-height:1.1;margin-bottom:20px;animation:fadeInUp .6s .1s var(--ease-smooth) both}
+.hero-title em{font-style:normal;color:var(--accent)}
+.hero-desc{font-size:17px;color:var(--ink2);line-height:1.7;max-width:460px;margin-bottom:36px;animation:fadeInUp .6s .2s var(--ease-smooth) both}
+.hero-actions{display:flex;align-items:center;gap:16px;flex-wrap:wrap;animation:fadeInUp .6s .3s var(--ease-smooth) both}
+.btn-primary{display:inline-flex;align-items:center;gap:8px;padding:14px 28px;border-radius:12px;background:var(--ink);color:#fff;font-size:15px;font-weight:600;box-shadow:0 4px 16px rgba(0,0,0,.2);transition:transform .2s var(--ease-spring),box-shadow .2s}
+.btn-primary:hover{transform:translateY(-2px);box-shadow:0 8px 24px rgba(0,0,0,.25)}
+.btn-secondary{display:inline-flex;align-items:center;gap:8px;padding:14px 28px;border-radius:12px;background:var(--surface);color:var(--ink);font-size:15px;font-weight:600;border:1.5px solid var(--border);box-shadow:var(--shadow-sm);transition:transform .2s var(--ease-spring),box-shadow .2s,border-color .2s}
+.btn-secondary:hover{transform:translateY(-2px);box-shadow:var(--shadow-md);border-color:var(--border2)}
+.hero-stats{display:flex;gap:32px;margin-top:48px;animation:fadeInUp .6s .4s var(--ease-smooth) both}
+.hero-stat-num{font-size:22px;font-weight:800;color:var(--ink);font-family:var(--font-fun)}
+.hero-stat-label{font-size:12px;color:var(--ink3);font-weight:500}
+.hero-visual{position:relative;display:flex;justify-content:center;align-items:center;animation:fadeInRight .8s .2s var(--ease-smooth) both}
+.math-stage{width:100%;max-width:440px;aspect-ratio:1}
+.math-stage svg{width:100%;height:100%;filter:drop-shadow(0 20px 60px rgba(37,99,235,.12))}
+
+/* FEATURES STRIP */
+.features-strip{padding:20px 40px;border-top:1px solid var(--border);border-bottom:1px solid var(--border);background:var(--surface);overflow:hidden}
+.features-scroll{display:flex;gap:48px;align-items:center;animation:marquee 30s linear infinite;white-space:nowrap}
+.features-scroll span{display:flex;align-items:center;gap:10px;font-size:13px;font-weight:600;color:var(--ink2);letter-spacing:.02em;flex-shrink:0}
+.features-scroll .dot{color:var(--accent);font-size:18px}
+@keyframes marquee{0%{transform:translateX(0)}100%{transform:translateX(-50%)}}
+
+/* SECTIONS */
+section{padding:96px 40px}
+.section-label{display:inline-flex;align-items:center;gap:6px;font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--accent);margin-bottom:14px}
+.section-title{font-size:clamp(26px,3.5vw,40px);font-weight:800;letter-spacing:-.025em;line-height:1.15;margin-bottom:16px}
+.section-desc{font-size:17px;color:var(--ink2);line-height:1.7;max-width:520px}
+.section-inner{max-width:1100px;margin:0 auto}
+
+/* SOLVER */
+.solver-section{background:var(--surface)}
+.solver-layout{display:grid;grid-template-columns:340px 1fr;gap:32px;margin-top:56px}
+.mode-tabs{display:flex;gap:4px;background:var(--surface2);border-radius:var(--r-md);padding:4px;margin-bottom:24px}
+.mode-tab{flex:1;padding:9px 14px;border-radius:10px;font-size:13px;font-weight:600;color:var(--ink2);transition:all .2s;text-align:center}
+.mode-tab.active{background:var(--surface);color:var(--ink);box-shadow:var(--shadow-sm)}
+.mode-tab:hover:not(.active){color:var(--ink)}
+.panel-card{background:var(--surface);border-radius:var(--r-xl);border:1.5px solid var(--border);box-shadow:var(--shadow-md);padding:28px;transition:box-shadow .3s}
+.panel-card:hover{box-shadow:var(--shadow-lg)}
+.form-group{margin-bottom:20px}
+.form-label{display:block;font-size:12px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--ink2);margin-bottom:8px}
+.form-input{width:100%;padding:11px 14px;border-radius:var(--r-md);border:1.5px solid var(--border);background:var(--bg);font-size:14px;color:var(--ink);transition:border-color .2s,box-shadow .2s;outline:none}
+.form-input:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(37,99,235,.12)}
+.form-select{width:100%;padding:11px 14px;border-radius:var(--r-md);border:1.5px solid var(--border);background:var(--bg);font-size:14px;color:var(--ink);appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%238A8680' d='M6 8L1 3h10z'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 14px center;outline:none;cursor:pointer;transition:border-color .2s,box-shadow .2s}
+.form-select:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(37,99,235,.12)}
+.matrix-grid{display:grid;gap:6px;margin-bottom:8px}
+.matrix-cell{padding:9px 10px;border-radius:8px;border:1.5px solid var(--border);background:var(--bg);font-family:var(--font-mono);font-size:13px;color:var(--ink);text-align:center;outline:none;width:100%;transition:border-color .2s,box-shadow .2s}
+.matrix-cell:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(37,99,235,.12)}
+.matrix-label-row,.matrix-label-col{font-family:var(--font-mono);font-size:11px;font-weight:600;color:var(--accent);text-align:center;padding:4px;letter-spacing:.04em}
+.result-panel{display:flex;flex-direction:column;gap:20px}
+.result-card{background:var(--surface);border-radius:var(--r-xl);border:1.5px solid var(--border);box-shadow:var(--shadow-md);padding:28px;animation:fadeInUp .4s var(--ease-smooth) both}
+.result-status{display:flex;align-items:center;gap:10px;padding:12px 16px;border-radius:var(--r-md);font-size:14px;font-weight:600;margin-bottom:20px}
+.result-status.converged{background:var(--success-lt);color:var(--success)}
+.result-status.diverged{background:var(--warn-lt);color:var(--warn)}
+.result-status .status-icon{font-size:18px}
+.solution-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:12px;margin-bottom:20px}
+.solution-var{background:var(--surface2);border-radius:var(--r-md);padding:14px 16px;border:1.5px solid var(--border);transition:transform .2s var(--ease-spring),box-shadow .2s}
+.solution-var:hover{transform:translateY(-2px);box-shadow:var(--shadow-sm)}
+.solution-var-name{font-family:var(--font-mono);font-size:11px;font-weight:600;color:var(--accent);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px}
+.solution-var-val{font-family:var(--font-mono);font-size:18px;font-weight:600;color:var(--ink)}
+.diag-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.diag-item{background:var(--surface2);border-radius:var(--r-md);padding:12px 14px;border:1.5px solid var(--border)}
+.diag-key{font-size:11px;font-weight:700;color:var(--ink3);text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px}
+.diag-val{font-family:var(--font-mono);font-size:14px;font-weight:600;color:var(--ink)}
+.stability-excellent{color:var(--success)!important}
+.stability-fair{color:var(--warn)!important}
+.stability-risky{color:var(--danger)!important}
+.iter-table-wrap{overflow-x:auto;border-radius:var(--r-md);border:1.5px solid var(--border)}
+.iter-table{width:100%;border-collapse:collapse;font-size:13px}
+.iter-table th{background:var(--surface2);font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--ink2);padding:10px 14px;text-align:left;border-bottom:1px solid var(--border)}
+.iter-table td{padding:9px 14px;border-bottom:1px solid var(--border)}
+.iter-table tr:last-child td{border-bottom:none}
+.iter-table tr:nth-child(even) td{background:var(--surface2)}
+.mono{font-family:var(--font-mono)}
+.history-section{background:var(--bg)}
+.history-list{display:flex;flex-direction:column;gap:10px;margin-top:24px}
+.history-item{background:var(--surface);border:1.5px solid var(--border);border-radius:var(--r-lg);padding:16px 20px;display:flex;align-items:center;justify-content:space-between;gap:16px;transition:border-color .2s,box-shadow .2s;cursor:pointer}
+.history-item:hover{border-color:var(--accent);box-shadow:0 0 0 3px rgba(37,99,235,.08)}
+.history-item-meta{font-size:12px;color:var(--ink3)}
+.history-badge{padding:3px 10px;border-radius:99px;font-size:11px;font-weight:700;letter-spacing:.04em}
+.badge-converged{background:var(--success-lt);color:var(--success)}
+.badge-diverged{background:var(--warn-lt);color:var(--warn)}
+
+/* HOW + DOMAINS */
+.how-section{background:var(--bg)}
+.steps-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:24px;margin-top:56px}
+.step-card{background:var(--surface);border-radius:var(--r-xl);padding:32px 28px;border:1.5px solid var(--border);box-shadow:var(--shadow-sm);position:relative;overflow:hidden;transition:transform .3s var(--ease-spring),box-shadow .3s}
+.step-card:hover{transform:translateY(-4px);box-shadow:var(--shadow-lg)}
+.step-card::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;background:linear-gradient(90deg,var(--accent),var(--accent2))}
+.step-num{font-family:var(--font-fun);font-size:48px;font-weight:800;color:var(--border);position:absolute;top:16px;right:20px;line-height:1;user-select:none}
+.step-icon{width:48px;height:48px;border-radius:12px;background:var(--accent-lt);display:flex;align-items:center;justify-content:center;font-size:22px;margin-bottom:20px}
+.step-title{font-size:17px;font-weight:700;margin-bottom:10px;letter-spacing:-.01em}
+.step-desc{font-size:14px;color:var(--ink2);line-height:1.65}
+.domains-section{background:var(--surface)}
+.domains-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:20px;margin-top:56px}
+.domain-card{border-radius:var(--r-xl);border:1.5px solid var(--border);padding:28px;background:var(--bg);display:flex;align-items:flex-start;gap:18px;transition:all .3s var(--ease-spring);cursor:pointer}
+.domain-card:hover{border-color:var(--accent);background:var(--surface);transform:translateY(-3px);box-shadow:var(--shadow-lg)}
+.domain-icon{width:52px;height:52px;border-radius:14px;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:24px}
+.domain-title{font-size:16px;font-weight:700;margin-bottom:6px;letter-spacing:-.01em}
+.domain-desc{font-size:13px;color:var(--ink2);line-height:1.6}
+
+/* FOOTER */
+footer{background:var(--ink);color:rgba(255,255,255,.7);padding:64px 40px 40px}
+.footer-inner{max-width:1100px;margin:0 auto;display:grid;grid-template-columns:1fr 1fr;gap:48px;border-bottom:1px solid rgba(255,255,255,.08);padding-bottom:48px;margin-bottom:32px}
+.footer-brand-name{font-size:18px;font-weight:800;color:#fff;margin-bottom:10px;letter-spacing:-.02em}
+.footer-brand-desc{font-size:13px;line-height:1.7;max-width:280px}
+.footer-links{display:flex;gap:48px}
+.footer-col-title{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:rgba(255,255,255,.4);margin-bottom:16px}
+.footer-col a{display:block;font-size:13px;color:rgba(255,255,255,.6);margin-bottom:10px;transition:color .2s}
+.footer-col a:hover{color:#fff}
+.footer-bottom{max-width:1100px;margin:0 auto;display:flex;align-items:center;justify-content:space-between}
+.footer-copy,.footer-made{font-size:12px}
+
+/* ANIMATIONS */
+@keyframes fadeInUp{from{opacity:0;transform:translateY(24px)}to{opacity:1;transform:translateY(0)}}
+@keyframes fadeInRight{from{opacity:0;transform:translateX(32px)}to{opacity:1;transform:translateX(0)}}
+.appear{opacity:0;transform:translateY(20px);transition:opacity .6s var(--ease-smooth),transform .6s var(--ease-smooth)}
+.appear.visible{opacity:1;transform:translateY(0)}
+.btn-solve{width:100%;padding:14px;background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;border-radius:var(--r-md);font-size:15px;font-weight:700;letter-spacing:.01em;box-shadow:0 4px 16px rgba(37,99,235,.3);transition:transform .2s var(--ease-spring),box-shadow .2s,opacity .2s;display:flex;align-items:center;justify-content:center;gap:8px}
+.btn-solve:hover:not(:disabled){transform:translateY(-2px);box-shadow:0 8px 24px rgba(37,99,235,.4)}
+.btn-solve:disabled{opacity:.6;cursor:not-allowed}
+.btn-solve.loading::after{content:'';width:16px;height:16px;border:2px solid rgba(255,255,255,.4);border-top-color:#fff;border-radius:50%;animation:spin .6s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.result-placeholder{display:flex;flex-direction:column;align-items:center;justify-content:center;height:320px;border-radius:var(--r-xl);border:2px dashed var(--border);gap:16px;color:var(--ink3)}
+.result-placeholder svg{opacity:.3}
+.size-row{display:flex;align-items:center;gap:8px;margin-bottom:16px}
+.size-btn{width:30px;height:30px;border-radius:8px;border:1.5px solid var(--border);background:var(--surface);font-size:16px;font-weight:700;color:var(--ink2);display:flex;align-items:center;justify-content:center;transition:all .15s;line-height:1}
+.size-btn:hover{border-color:var(--accent);color:var(--accent);background:var(--accent-lt)}
+.size-label{font-size:13px;font-weight:600;color:var(--ink);min-width:80px}
+.input-mode{display:none}
+.input-mode.active{display:block}
+
+/* RESPONSIVE */
+@media(max-width:900px){
+  .navbar{padding:0 20px}.nav-links{display:none}
+  .hero{padding:100px 20px 60px}
+  .hero-inner{grid-template-columns:1fr;gap:48px}
+  .hero-visual{order:-1}
+  .solver-layout{grid-template-columns:1fr}
+  .steps-grid{grid-template-columns:1fr}
+  .domains-grid{grid-template-columns:1fr}
+  section{padding:64px 20px}
+  .footer-inner{grid-template-columns:1fr}
+  .footer-links{gap:32px}
+  .footer-bottom{flex-direction:column;gap:12px;text-align:center}
+  .diag-grid{grid-template-columns:1fr}
+  .solution-grid{grid-template-columns:1fr 1fr}
+}
+@media(max-width:500px){
+  .hero-stats{gap:20px}
+  .hero-actions{flex-direction:column;align-items:flex-start}
+  .btn-primary,.btn-secondary{width:100%;justify-content:center}
+}
+</style>
 </head>
 <body>
-    <div class="math-sky" aria-hidden="true">
-        <span class="math-symbol" style="left:6%;font-size:32px;--dur:18s;--delay:0s">∑</span>
-        <span class="math-symbol" style="left:14%;font-size:24px;--dur:14s;--delay:2s">π</span>
-        <span class="math-symbol" style="left:22%;font-size:28px;--dur:17s;--delay:4s">√</span>
-        <span class="math-symbol" style="left:34%;font-size:26px;--dur:20s;--delay:1s">∞</span>
-        <span class="math-symbol" style="left:46%;font-size:30px;--dur:15s;--delay:3s">x²</span>
-        <span class="math-symbol" style="left:58%;font-size:22px;--dur:16s;--delay:5s">Δ</span>
-        <span class="math-symbol" style="left:68%;font-size:30px;--dur:19s;--delay:2.5s">∫</span>
-        <span class="math-symbol" style="left:78%;font-size:24px;--dur:13s;--delay:6s">≈</span>
-        <span class="math-symbol" style="left:88%;font-size:28px;--dur:21s;--delay:1.5s">θ</span>
+
+<!-- NAVBAR -->
+<nav class="navbar" id="navbar">
+  <div class="nav-logo">
+    <div class="nav-logo-icon">G&#x2211;</div>
+    GaussSolve
+  </div>
+  <div class="nav-links">
+    <a href="#solver">Solver</a>
+    <a href="#how">How it works</a>
+    <a href="#domains">Domains</a>
+    <a href="#history">History</a>
+  </div>
+  <button class="nav-cta" onclick="document.getElementById('solver').scrollIntoView({behavior:'smooth'})">
+    Start Solving &rarr;
+  </button>
+</nav>
+
+<!-- HERO -->
+<section class="hero" id="hero">
+  <div class="hero-bg"></div>
+  <div class="hero-grid"></div>
+  <div class="hero-inner">
+    <div class="hero-content">
+      <div class="hero-badge"><span class="hero-badge-dot"></span>Iterative Numerical Methods</div>
+      <h1 class="hero-title">Solve Linear<br/>Systems with<br/><em>Elegance</em></h1>
+      <p class="hero-desc">Harness the power of Gauss-Seidel iteration to solve complex linear equations across engineering, economics, and science &mdash; instantly, visually, precisely.</p>
+      <div class="hero-actions">
+        <button class="btn-primary" onclick="document.getElementById('solver').scrollIntoView({behavior:'smooth'})">&#x26A1; Launch Solver</button>
+        <button class="btn-secondary" onclick="document.getElementById('how').scrollIntoView({behavior:'smooth'})">See how it works</button>
+      </div>
+      <div class="hero-stats">
+        <div><div class="hero-stat-num">&#x221E;</div><div class="hero-stat-label">Iterations logged</div></div>
+        <div style="width:1px;background:var(--border);height:36px;margin-top:4px;"></div>
+        <div><div class="hero-stat-num">4</div><div class="hero-stat-label">Domain presets</div></div>
+        <div style="width:1px;background:var(--border);height:36px;margin-top:4px;"></div>
+        <div><div class="hero-stat-num">10&#x207B;&#x2074;</div><div class="hero-stat-label">Default tolerance</div></div>
+      </div>
     </div>
-    <div class="container">
-        <div class="header">
-            <h1>Gauss-Seidel Iterative Solver</h1>
-            <p class="subtitle">Numerical solution for systems of linear equations with live diagnostics and saved history.</p>
-            <div class="hero-tags">
-                <span class="hero-tag">Fast Iteration Tracking</span>
-                <span class="hero-tag">Residual Diagnostics</span>
-                <span class="hero-tag">Persistent History</span>
-            </div>
-        </div>
-
-        <div class="mode-selector">
-            <button class="mode-btn active" onclick="setMode('matrix')" id="matrixBtn">
-                Matrix Form
-            </button>
-            <button class="mode-btn" onclick="setMode('equation')" id="equationBtn">
-                Equation Form
-            </button>
-            <button class="mode-btn" onclick="setMode('domain')" id="domainBtn">
-                Domain Models
-            </button>
-        </div>
-
-        <div id="matrixMode" class="input-section">
-            <div class="form-group">
-                <label>Number of Variables:</label>
-                <input type="number" id="matrixSize" min="2" max="10" value="3" onchange="generateMatrixInputs()">
-            </div>
-
-            <div class="form-group">
-                <label>Coefficient Matrix (A):</label>
-                <div id="matrixInputs"></div>
-            </div>
-
-            <div class="form-group">
-                <label>Constants Vector (b):</label>
-                <div id="constantInputs"></div>
-            </div>
-        </div>
-
-        <div id="equationMode" class="input-section" style="display: none;">
-            <div class="form-group">
-                <label>Number of Equations:</label>
-                <input type="number" id="numEquations" min="2" max="10" value="3" onchange="generateEquationInputs()">
-            </div>
-
-            <div class="form-group">
-                <label>Enter Equations (e.g., 2x + 3y - z = 5):</label>
-                <div id="equationInputs"></div>
-            </div>
-
-            <div class="info-box">
-                <strong>Input format:</strong> Enter equations in standard form (e.g., 2x + 3y - z = 5). Variables can be any letters.
-            </div>
-        </div>
-
-        <div id="domainMode" class="input-section" style="display: none;">
-            <div class="form-group">
-                <label>Engineering/Science Model:</label>
-                <select id="domainType" onchange="generateDomainInputs()" style="width:100%;padding:11px 14px;border:2px solid #e5e7eb;border-radius:8px;font-size:14px;background:white;">
-                    <option value="electrical">Electrical Circuit Solver</option>
-                    <option value="structural">Structural Engineering Loads</option>
-                    <option value="economics">Economics Equilibrium Model</option>
-                    <option value="chemical">Chemical Balance Systems</option>
-                </select>
-            </div>
-            <div class="domain-card">
-                <div id="domainInputs" class="domain-grid"></div>
-                <div id="domainDescription" class="domain-note"></div>
-            </div>
-        </div>
-
-        <div class="input-section" style="margin-top: 0;">
-            <div class="form-group">
-                <label>Tolerance:</label>
-                <input type="number" id="tolerance" step="any" min="0.0000001" value="0.0001">
-            </div>
-            <div class="form-group">
-                <label>Maximum Iterations:</label>
-                <input type="number" id="maxIterations" min="1" max="5000" value="1000">
-            </div>
-        </div>
-
-        <div class="action-row">
-            <button class="solve-btn" onclick="solve()">
-                <span id="solveText">Compute Solution</span>
-            </button>
-            <button class="secondary-btn" onclick="toggleHistory()">View History</button>
-            <button class="secondary-btn clear-btn" onclick="clearHistoryRecords()">Clear History</button>
-        </div>
-        <div style="margin-top:10px;">
-            <button class="secondary-btn" onclick="toggleExplanation()" style="width:100%;">📘 Explanation: How this was solved</button>
-        </div>
-
-        <div id="results" style="display: none;"></div>
-        <div id="explanationPanel" class="explain-panel" style="display: none;"></div>
-        <div id="historyPanel" class="history-panel" style="display: none;"></div>
+    <!-- Cartoon Math SVG Animation -->
+    <div class="hero-visual">
+      <div class="math-stage">
+        <svg viewBox="0 0 440 440" xmlns="http://www.w3.org/2000/svg">
+          <defs>
+            <radialGradient id="bg-grd" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="#EEF4FF"/><stop offset="100%" stop-color="#F8F7F4"/></radialGradient>
+            <filter id="shadow"><feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="#2563EB" flood-opacity=".15"/></filter>
+            <filter id="shadow-sm"><feDropShadow dx="0" dy="2" stdDeviation="4" flood-color="#000" flood-opacity=".08"/></filter>
+          </defs>
+          <rect x="20" y="20" width="400" height="400" rx="28" fill="url(#bg-grd)" stroke="#E8E6E1" stroke-width="1.5"/>
+          <g stroke="#E8E6E1" stroke-width="1" opacity=".5">
+            <line x1="20" y1="100" x2="420" y2="100"/><line x1="20" y1="180" x2="420" y2="180"/>
+            <line x1="20" y1="260" x2="420" y2="260"/><line x1="20" y1="340" x2="420" y2="340"/>
+            <line x1="100" y1="20" x2="100" y2="420"/><line x1="180" y1="20" x2="180" y2="420"/>
+            <line x1="260" y1="20" x2="260" y2="420"/><line x1="340" y1="20" x2="340" y2="420"/>
+          </g>
+          <polyline points="50,380 100,280 150,210 180,165 200,145 215,136 225,132 232,130 237,129.5"
+            fill="none" stroke="#2563EB" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"
+            stroke-dasharray="400" stroke-dashoffset="400" opacity=".8">
+            <animate attributeName="stroke-dashoffset" values="400;0" dur="2.5s" begin="0.5s" fill="freeze" calcMode="spline" keySplines="0.25 0.46 0.45 0.94"/>
+          </polyline>
+          <line x1="50" y1="129" x2="390" y2="129" stroke="#7C3AED" stroke-width="1.5" stroke-dasharray="6 4" opacity=".4"/>
+          <text x="394" y="133" font-family="JetBrains Mono,monospace" font-size="10" fill="#7C3AED" opacity=".7" font-weight="600">x*</text>
+          <circle cx="50"  cy="380" r="5" fill="#2563EB" opacity="0"><animate attributeName="opacity" values="0;1" dur=".1s" begin="0.5s" fill="freeze"/><animate attributeName="r" values="0;5" dur=".3s" begin="0.5s" fill="freeze" calcMode="spline" keySplines=".34 1.56 .64 1"/></circle>
+          <circle cx="100" cy="280" r="5" fill="#2563EB" opacity="0"><animate attributeName="opacity" values="0;1" dur=".1s" begin="1.0s" fill="freeze"/><animate attributeName="r" values="0;5" dur=".3s" begin="1.0s" fill="freeze" calcMode="spline" keySplines=".34 1.56 .64 1"/></circle>
+          <circle cx="150" cy="210" r="5" fill="#2563EB" opacity="0"><animate attributeName="opacity" values="0;1" dur=".1s" begin="1.4s" fill="freeze"/><animate attributeName="r" values="0;5" dur=".3s" begin="1.4s" fill="freeze" calcMode="spline" keySplines=".34 1.56 .64 1"/></circle>
+          <circle cx="200" cy="145" r="5" fill="#2563EB" opacity="0"><animate attributeName="opacity" values="0;1" dur=".1s" begin="1.8s" fill="freeze"/><animate attributeName="r" values="0;5" dur=".3s" begin="1.8s" fill="freeze" calcMode="spline" keySplines=".34 1.56 .64 1"/></circle>
+          <circle cx="237" cy="129" r="7" fill="#059669" opacity="0"><animate attributeName="opacity" values="0;1" dur=".1s" begin="2.8s" fill="freeze"/><animate attributeName="r" values="0;7" dur=".4s" begin="2.8s" fill="freeze" calcMode="spline" keySplines=".34 1.56 .64 1"/></circle>
+          <g font-family="Nunito,sans-serif" font-weight="800" font-size="11">
+            <g opacity="0"><animate attributeName="opacity" values="0;1" dur=".2s" begin="0.7s" fill="freeze"/>
+              <rect x="56" y="354" width="28" height="18" rx="5" fill="#DBEAFE"/><text x="70" y="366" text-anchor="middle" fill="#2563EB">i=1</text></g>
+            <g opacity="0"><animate attributeName="opacity" values="0;1" dur=".2s" begin="1.2s" fill="freeze"/>
+              <rect x="106" y="256" width="28" height="18" rx="5" fill="#DBEAFE"/><text x="120" y="268" text-anchor="middle" fill="#2563EB">i=2</text></g>
+            <g opacity="0"><animate attributeName="opacity" values="0;1" dur=".2s" begin="1.6s" fill="freeze"/>
+              <rect x="156" y="186" width="28" height="18" rx="5" fill="#DBEAFE"/><text x="170" y="198" text-anchor="middle" fill="#2563EB">i=3</text></g>
+            <g opacity="0"><animate attributeName="opacity" values="0;1" dur=".2s" begin="2.0s" fill="freeze"/>
+              <rect x="206" y="120" width="28" height="18" rx="5" fill="#DBEAFE"/><text x="220" y="132" text-anchor="middle" fill="#2563EB">i=4</text></g>
+          </g>
+          <g opacity="0"><animate attributeName="opacity" values="0;1" dur=".5s" begin="3.0s" fill="freeze" calcMode="spline" keySplines=".34 1.56 .64 1"/>
+            <rect x="250" y="100" width="130" height="42" rx="12" fill="#059669" filter="url(#shadow)"/>
+            <text x="315" y="118" font-family="Nunito,sans-serif" font-weight="800" font-size="11" fill="#fff" text-anchor="middle">&#x2713; CONVERGED!</text>
+            <text x="315" y="133" font-family="JetBrains Mono,monospace" font-size="10" fill="rgba(255,255,255,.8)" text-anchor="middle">&#x03B4; &lt; 1&#xD7;10&#x207B;&#x2074;</text>
+          </g>
+          <g font-family="Nunito,sans-serif" font-weight="800">
+            <g filter="url(#shadow-sm)"><rect x="32" y="36" width="54" height="36" rx="10" fill="white" stroke="#E8E6E1" stroke-width="1"/>
+              <text x="59" y="59" text-anchor="middle" font-size="20" fill="#7C3AED">&#x2211;</text>
+              <animateTransform attributeName="transform" type="translate" values="0,0;0,-4;0,0" dur="3s" repeatCount="indefinite" calcMode="spline" keySplines=".45 0 .55 1;.45 0 .55 1"/></g>
+            <g filter="url(#shadow-sm)"><rect x="340" y="44" width="52" height="32" rx="10" fill="white" stroke="#E8E6E1" stroke-width="1"/>
+              <text x="366" y="65" text-anchor="middle" font-size="16" font-weight="800" fill="#2563EB">=</text>
+              <animateTransform attributeName="transform" type="translate" values="0,0;0,4;0,0" dur="2.5s" repeatCount="indefinite" calcMode="spline" keySplines=".45 0 .55 1;.45 0 .55 1"/></g>
+            <g filter="url(#shadow-sm)"><rect x="290" y="360" width="100" height="36" rx="10" fill="white" stroke="#E8E6E1" stroke-width="1"/>
+              <text x="340" y="383" text-anchor="middle" font-size="14" font-family="JetBrains Mono,monospace" fill="#1A1916" font-weight="600">Ax = b</text>
+              <animateTransform attributeName="transform" type="translate" values="0,0;0,-3;0,0" dur="3.5s" repeatCount="indefinite" calcMode="spline" keySplines=".45 0 .55 1;.45 0 .55 1"/></g>
+            <g filter="url(#shadow-sm)"><rect x="32" y="370" width="90" height="32" rx="10" fill="white" stroke="#E8E6E1" stroke-width="1"/>
+              <text x="77" y="391" text-anchor="middle" font-size="11" font-family="JetBrains Mono,monospace" fill="#D97706" font-weight="600">tol=1e-4</text>
+              <animateTransform attributeName="transform" type="translate" values="0,0;0,3;0,0" dur="2.8s" repeatCount="indefinite" calcMode="spline" keySplines=".45 0 .55 1;.45 0 .55 1"/></g>
+          </g>
+        </svg>
+      </div>
     </div>
+  </div>
+</section>
 
-    <script>
-        let currentMode = 'matrix';
-        let lastResult = null;
+<!-- FEATURES STRIP -->
+<div class="features-strip">
+  <div class="features-scroll">
+    <span><span class="dot">&#x25CF;</span>Gauss-Seidel Iteration</span>
+    <span><span class="dot">&#x25CF;</span>Matrix Mode</span>
+    <span><span class="dot">&#x25CF;</span>Equation Parser</span>
+    <span><span class="dot">&#x25CF;</span>Domain Presets</span>
+    <span><span class="dot">&#x25CF;</span>Convergence Diagnostics</span>
+    <span><span class="dot">&#x25CF;</span>History Logging</span>
+    <span><span class="dot">&#x25CF;</span>Residual Analysis</span>
+    <span><span class="dot">&#x25CF;</span>Diagonal Dominance Check</span>
+    <span><span class="dot">&#x25CF;</span>Gauss-Seidel Iteration</span>
+    <span><span class="dot">&#x25CF;</span>Matrix Mode</span>
+    <span><span class="dot">&#x25CF;</span>Equation Parser</span>
+    <span><span class="dot">&#x25CF;</span>Domain Presets</span>
+    <span><span class="dot">&#x25CF;</span>Convergence Diagnostics</span>
+    <span><span class="dot">&#x25CF;</span>History Logging</span>
+    <span><span class="dot">&#x25CF;</span>Residual Analysis</span>
+    <span><span class="dot">&#x25CF;</span>Diagonal Dominance Check</span>
+  </div>
+</div>
 
-        function setMode(mode) {
-            currentMode = mode;
-            document.getElementById('matrixBtn').classList.toggle('active', mode === 'matrix');
-            document.getElementById('equationBtn').classList.toggle('active', mode === 'equation');
-            document.getElementById('domainBtn').classList.toggle('active', mode === 'domain');
-            document.getElementById('matrixMode').style.display = mode === 'matrix' ? 'block' : 'none';
-            document.getElementById('equationMode').style.display = mode === 'equation' ? 'block' : 'none';
-            document.getElementById('domainMode').style.display = mode === 'domain' ? 'block' : 'none';
-            
-            if (mode === 'matrix') {
-                generateMatrixInputs();
-            } else if (mode === 'equation') {
-                generateEquationInputs();
-            } else {
-                generateDomainInputs();
-            }
-        }
+<!-- SOLVER -->
+<section class="solver-section" id="solver">
+  <div class="section-inner">
+    <div class="section-label">&#x26A1; Interactive Tool</div>
+    <h2 class="section-title">The Solver</h2>
+    <p class="section-desc">Choose your input mode, configure your system, and watch it converge &mdash; step by step.</p>
+    <div class="solver-layout">
+      <div>
+        <div class="mode-tabs">
+          <button class="mode-tab active" onclick="setMode('matrix',this)">Matrix</button>
+          <button class="mode-tab" onclick="setMode('equation',this)">Equations</button>
+          <button class="mode-tab" onclick="setMode('domain',this)">Domain</button>
+        </div>
+        <div class="panel-card">
+          <div class="input-mode active" id="mode-matrix">
+            <div class="size-row">
+              <button class="size-btn" onclick="resizeMatrix(-1)">&#x2212;</button>
+              <span class="size-label" id="size-label">3 &times; 3 system</span>
+              <button class="size-btn" onclick="resizeMatrix(1)">+</button>
+            </div>
+            <div class="form-label">Matrix A</div>
+            <div id="matrix-A-wrap"></div>
+            <div class="form-label" style="margin-top:16px;">Vector b</div>
+            <div id="matrix-b-wrap"></div>
+          </div>
+          <div class="input-mode" id="mode-equation">
+            <div class="form-label">Equations (one per line)</div>
+            <div style="font-size:12px;color:var(--ink3);margin-bottom:8px;">e.g. <span style="font-family:var(--font-mono);color:var(--accent)">10x-2y=16</span></div>
+            <textarea class="form-input" id="eq-input" rows="5" placeholder="10x-2y=16&#10;-2x+10y=24&#10;" style="resize:vertical;font-family:var(--font-mono);font-size:13px;"></textarea>
+          </div>
+          <div class="input-mode" id="mode-domain">
+            <div class="form-group">
+              <label class="form-label">Domain Preset</label>
+              <select class="form-select" id="domain-select" onchange="renderDomainFields()">
+                <option value="electrical">&#x26A1; Electrical Circuit</option>
+                <option value="structural">&#x1F3D7; Structural Engineering</option>
+                <option value="economics">&#x1F4C8; Economics Model</option>
+                <option value="chemical">&#x2697; Chemical Balance</option>
+              </select>
+            </div>
+            <div id="domain-params"></div>
+          </div>
+          <div style="margin-top:20px;padding-top:20px;border-top:1px solid var(--border);">
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px;">
+              <div class="form-group" style="margin:0"><label class="form-label">Tolerance</label>
+                <input class="form-input" type="number" id="tol" value="0.0001" step="0.0001" min="0.000001"/></div>
+              <div class="form-group" style="margin:0"><label class="form-label">Max Iterations</label>
+                <input class="form-input" type="number" id="maxIter" value="1000" min="1" max="10000"/></div>
+            </div>
+            <button class="btn-solve" id="solve-btn" onclick="solve()">
+              <span id="solve-label">&#x26A1; Solve System</span>
+            </button>
+          </div>
+        </div>
+      </div>
+      <div class="result-panel" id="result-panel">
+        <div class="result-placeholder" id="result-placeholder">
+          <svg width="64" height="64" viewBox="0 0 64 64" fill="none">
+            <rect x="8" y="8" width="48" height="48" rx="12" stroke="#8A8680" stroke-width="2"/>
+            <path d="M20 32h24M32 20v24" stroke="#8A8680" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+          <div style="font-size:14px;font-weight:600;color:var(--ink3);">Configure and solve a system</div>
+          <div style="font-size:12px;">Results will appear here</div>
+        </div>
+        <div id="result-content" style="display:none;"></div>
+      </div>
+    </div>
+  </div>
+</section>
 
-        function generateMatrixInputs() {
-            const n = parseInt(document.getElementById('matrixSize').value);
-            const matrixInputs = document.getElementById('matrixInputs');
-            const constantInputs = document.getElementById('constantInputs');
-            
-            matrixInputs.innerHTML = '';
-            constantInputs.innerHTML = '';
+<!-- HOW IT WORKS -->
+<section class="how-section" id="how">
+  <div class="section-inner">
+    <div class="section-label appear">&#x1F522; Method</div>
+    <h2 class="section-title appear">How Gauss-Seidel Works</h2>
+    <p class="section-desc appear">An elegant iterative technique that updates each variable using the most recent values &mdash; converging faster than Jacobi.</p>
+    <div class="steps-grid">
+      <div class="step-card appear"><span class="step-num">01</span>
+        <div class="step-icon">&#x1F3AF;</div>
+        <div class="step-title">Initial Guess</div>
+        <div class="step-desc">Start with all variables set to zero. The method finds its way to the solution regardless of the starting point.</div>
+      </div>
+      <div class="step-card appear"><span class="step-num">02</span>
+        <div class="step-icon">&#x1F504;</div>
+        <div class="step-title">Iterative Update</div>
+        <div class="step-desc">For each variable, compute a new value using the latest known values of all other variables &mdash; faster than Jacobi.</div>
+      </div>
+      <div class="step-card appear"><span class="step-num">03</span>
+        <div class="step-icon">&#x2705;</div>
+        <div class="step-title">Convergence Check</div>
+        <div class="step-desc">After every sweep, check if max change &delta; is below the tolerance. If yes &mdash; done!</div>
+      </div>
+    </div>
+  </div>
+</section>
 
-            const matrixContainer = document.createElement('div');
-            matrixContainer.className = 'matrix-input';
+<!-- DOMAINS -->
+<section class="domains-section" id="domains">
+  <div class="section-inner">
+    <div class="section-label appear">&#x1F310; Applications</div>
+    <h2 class="section-title appear">Built for Real Engineering</h2>
+    <p class="section-desc appear">Pre-configured domain models let you solve real-world problems without manual setup.</p>
+    <div class="domains-grid">
+      <div class="domain-card appear" onclick="activateDomain('electrical')">
+        <div class="domain-icon" style="background:#EEF4FF;">&#x26A1;</div>
+        <div><div class="domain-title">Electrical Circuits</div>
+        <div class="domain-desc">Mesh current analysis using KVL. Solve multi-loop circuits with resistors and voltage sources instantly.</div></div>
+      </div>
+      <div class="domain-card appear" onclick="activateDomain('structural')">
+        <div class="domain-icon" style="background:#FEF9C3;">&#x1F3D7;</div>
+        <div><div class="domain-title">Structural Engineering</div>
+        <div class="domain-desc">Compute reaction forces and moments for static structures under distributed and point loads.</div></div>
+      </div>
+      <div class="domain-card appear" onclick="activateDomain('economics')">
+        <div class="domain-icon" style="background:#ECFDF5;">&#x1F4C8;</div>
+        <div><div class="domain-title">Economic Equilibrium</div>
+        <div class="domain-desc">Solve simultaneous supply/demand price models with cross-elasticity for multi-market equilibrium.</div></div>
+      </div>
+      <div class="domain-card appear" onclick="activateDomain('chemical')">
+        <div class="domain-icon" style="background:#FDF4FF;">&#x2697;</div>
+        <div><div class="domain-title">Chemical Kinetics</div>
+        <div class="domain-desc">Balance multi-species reaction networks and steady-state concentration systems.</div></div>
+      </div>
+    </div>
+  </div>
+</section>
 
-            for (let i = 0; i < n; i++) {
-                const row = document.createElement('div');
-                row.className = 'matrix-row';
-                row.style.animationDelay = `${i * 0.05}s`;
+<!-- HISTORY -->
+<section class="history-section" id="history">
+  <div class="section-inner">
+    <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:16px;">
+      <div>
+        <div class="section-label appear">&#x1F4CB; Logs</div>
+        <h2 class="section-title appear" style="margin-bottom:0;">Solve History</h2>
+      </div>
+      <div style="display:flex;gap:10px;">
+        <button class="btn-secondary" style="padding:10px 18px;font-size:13px;" onclick="loadHistory()">&#x21BB; Refresh</button>
+        <button class="btn-secondary" style="padding:10px 18px;font-size:13px;color:var(--danger);border-color:var(--danger);" onclick="clearHistory()">&#x1F5D1; Clear All</button>
+      </div>
+    </div>
+    <div class="history-list" id="history-list">
+      <div style="color:var(--ink3);font-size:14px;padding:32px 0;text-align:center;">Loading history&hellip;</div>
+    </div>
+  </div>
+</section>
 
-                for (let j = 0; j < n; j++) {
-                    const input = document.createElement('input');
-                    input.type = 'number';
-                    input.step = 'any';
-                    input.placeholder = `a${i+1}${j+1}`;
-                    input.id = `a${i}_${j}`;
-                    row.appendChild(input);
-                }
-                matrixContainer.appendChild(row);
-            }
-            matrixInputs.appendChild(matrixContainer);
+<!-- FOOTER -->
+<footer>
+  <div class="footer-inner">
+    <div>
+      <div class="footer-brand-name">GaussSolve</div>
+      <div class="footer-brand-desc">A precision-engineered numerical solver built for scientists, engineers, and analysts who demand accuracy and speed.</div>
+    </div>
+    <div class="footer-links">
+      <div class="footer-col">
+        <div class="footer-col-title">Tool</div>
+        <a href="#solver">Matrix Solver</a>
+        <a href="#solver">Equation Mode</a>
+        <a href="#domains">Domain Presets</a>
+        <a href="#history">History</a>
+      </div>
+      <div class="footer-col">
+        <div class="footer-col-title">Learn</div>
+        <a href="#how">How it works</a>
+        <a href="#domains">Applications</a>
+      </div>
+    </div>
+  </div>
+  <div class="footer-bottom">
+    <div class="footer-copy">&copy; 2025 GaussSolve. All rights reserved.</div>
+    <div class="footer-made">Built with precision &starf; Powered by Python &amp; Flask</div>
+  </div>
+</footer>
 
-            const constContainer = document.createElement('div');
-            constContainer.className = 'matrix-input';
-            for (let i = 0; i < n; i++) {
-                const input = document.createElement('input');
-                input.type = 'number';
-                input.step = 'any';
-                input.placeholder = `b${i+1}`;
-                input.id = `b${i}`;
-                constContainer.appendChild(input);
-            }
-            constantInputs.appendChild(constContainer);
-        }
+<script>
+var currentMode='matrix', matrixSize=3;
 
-        function generateEquationInputs() {
-            const n = parseInt(document.getElementById('numEquations').value);
-            const container = document.getElementById('equationInputs');
-            container.innerHTML = '';
+window.addEventListener('scroll',function(){
+  document.getElementById('navbar').classList.toggle('scrolled',window.scrollY>20);
+});
 
-            const examples = [
-                '10x - 2y - z = 3',
-                '-x + 11y - 2z = 25',
-                '-2x - y + 10z = -24'
-            ];
+var obs=new IntersectionObserver(function(entries){
+  entries.forEach(function(e,i){
+    if(e.isIntersecting){setTimeout(function(){e.target.classList.add('visible')},i*80);obs.unobserve(e.target);}
+  });
+},{threshold:.12});
+document.querySelectorAll('.appear').forEach(function(el){obs.observe(el);});
 
-            for (let i = 0; i < n; i++) {
-                const div = document.createElement('div');
-                div.className = 'equation-input';
-                div.style.animationDelay = `${i * 0.05}s`;
+function setMode(mode,btn){
+  currentMode=mode;
+  document.querySelectorAll('.mode-tab').forEach(function(t){t.classList.remove('active');});
+  btn.classList.add('active');
+  document.querySelectorAll('.input-mode').forEach(function(el){el.classList.remove('active');});
+  document.getElementById('mode-'+mode).classList.add('active');
+}
 
-                const number = document.createElement('div');
-                number.className = 'equation-number';
-                number.textContent = i + 1;
+function buildMatrix(){
+  var n=matrixSize;
+  document.getElementById('size-label').textContent=n+' \u00D7 '+n+' system';
+  var html='<div class="matrix-grid" style="grid-template-columns:repeat('+(n+1)+',1fr)"><div></div>';
+  for(var j=0;j<n;j++) html+='<div class="matrix-label-col">x'+(j+1)+'</div>';
+  for(var i=0;i<n;i++){
+    html+='<div class="matrix-label-row">r'+(i+1)+'</div>';
+    for(var j=0;j<n;j++){
+      var def=i===j?10:(Math.abs(i-j)===1?-1:0);
+      html+='<input class="matrix-cell" type="number" step="any" id="a'+i+j+'" value="'+def+'"/>';
+    }
+  }
+  html+='</div>';
+  document.getElementById('matrix-A-wrap').innerHTML=html;
+  var bDef=[16,24,15,8];
+  var bHtml='<div class="matrix-grid" style="grid-template-columns:repeat('+n+',1fr)">';
+  for(var i=0;i<n;i++) bHtml+='<input class="matrix-cell" type="number" step="any" id="b'+i+'" value="'+(bDef[i]||10)+'"/>';
+  bHtml+='</div>';
+  document.getElementById('matrix-b-wrap').innerHTML=bHtml;
+}
 
-                const input = document.createElement('input');
-                input.type = 'text';
-                input.id = `eq${i}`;
-                input.placeholder = examples[i] || `Enter equation ${i+1}`;
-                input.value = examples[i] || '';
+function resizeMatrix(d){matrixSize=Math.max(2,Math.min(6,matrixSize+d));buildMatrix();}
 
-                div.appendChild(number);
-                div.appendChild(input);
-                container.appendChild(div);
-            }
-        }
+var DOMAIN_FIELDS={
+  electrical:[{id:'r1',label:'R1 (\u03A9)',def:12},{id:'r2',label:'R2 (\u03A9)',def:10},{id:'r3',label:'R3 (\u03A9)',def:8},{id:'rm',label:'Rm (\u03A9)',def:2},{id:'v1',label:'V1 (V)',def:24},{id:'v2',label:'V2 (V)',def:18},{id:'v3',label:'V3 (V)',def:12}],
+  structural:[{id:'w',label:'Load W (kN)',def:120},{id:'xbar',label:'x\u0305 (m)',def:4},{id:'l1',label:'L1 (m)',def:3},{id:'l2',label:'L2 (m)',def:8},{id:'ka',label:'Ka',def:2.0},{id:'kb',label:'Kb',def:1.6},{id:'kc',label:'Kc',def:1.2},{id:'lateral',label:'Lateral (kN)',def:18}],
+  economics:[{id:'d1',label:'Demand D1',def:130},{id:'d2',label:'Demand D2',def:125},{id:'d3',label:'Demand D3',def:120}],
+  chemical:[{id:'c1',label:'Conc. C1',def:42},{id:'c2',label:'Conc. C2',def:38},{id:'c3',label:'Conc. C3',def:30}]
+};
 
-        function getDomainConfig(type) {
-            const configs = {
-                electrical: {
-                    description: 'Solve mesh currents from Kirchhoff voltage laws. Great for multi-loop circuit analysis.',
-                    fields: [
-                        ['r1', 'R1 (Ω)', 12], ['r2', 'R2 (Ω)', 10], ['r3', 'R3 (Ω)', 8],
-                        ['rm', 'Mutual Rm (Ω)', 2], ['v1', 'V1 (V)', 24], ['v2', 'V2 (V)', 18], ['v3', 'V3 (V)', 12],
-                    ],
-                },
-                structural: {
-                    description: 'Estimate support reactions using load balance + moment equilibrium + lateral compatibility.',
-                    fields: [
-                        ['w', 'Total Load W (kN)', 120], ['xbar', 'Centroid x̄ (m)', 4], ['l1', 'L1 (m)', 3], ['l2', 'L2 (m)', 8],
-                        ['ka', 'Stiffness kA', 2.0], ['kb', 'Stiffness kB', 1.6], ['kc', 'Stiffness kC', 1.2], ['lateral', 'Lateral eq. term', 18],
-                    ],
-                },
-                economics: {
-                    description: 'Find market equilibrium prices for three interdependent sectors from linearized demand-supply equations.',
-                    fields: [
-                        ['d1', 'Demand Constant D1', 130], ['d2', 'Demand Constant D2', 125], ['d3', 'Demand Constant D3', 120],
-                    ],
-                },
-                chemical: {
-                    description: 'Balance three species rates under coupled reaction constraints (steady-state approximation).',
-                    fields: [
-                        ['c1', 'Constraint C1', 42], ['c2', 'Constraint C2', 38], ['c3', 'Constraint C3', 30],
-                    ],
-                },
-            };
-            return configs[type] || configs.electrical;
-        }
+function renderDomainFields(){
+  var domain=document.getElementById('domain-select').value;
+  var fields=DOMAIN_FIELDS[domain]||[];
+  var cols=fields.length>4?2:1;
+  var html='<div style="display:grid;grid-template-columns:repeat('+cols+',1fr);gap:10px;">';
+  fields.forEach(function(f){
+    html+='<div class="form-group" style="margin:0"><label class="form-label">'+f.label+'</label>'
+        +'<input class="form-input" type="number" step="any" id="dp-'+f.id+'" value="'+f.def+'"/></div>';
+  });
+  html+='</div>';
+  document.getElementById('domain-params').innerHTML=html;
+}
 
-        function generateDomainInputs() {
-            const type = document.getElementById('domainType').value;
-            const config = getDomainConfig(type);
-            const container = document.getElementById('domainInputs');
-            const description = document.getElementById('domainDescription');
-            container.innerHTML = '';
-            description.textContent = config.description;
+async function solve(){
+  var btn=document.getElementById('solve-btn');
+  var label=document.getElementById('solve-label');
+  btn.disabled=true; btn.classList.add('loading'); label.textContent='Solving\u2026';
+  var tol=parseFloat(document.getElementById('tol').value)||1e-4;
+  var maxIter=parseInt(document.getElementById('maxIter').value)||1000;
+  var payload={mode:currentMode,tol:tol,maxIter:maxIter};
+  try{
+    if(currentMode==='matrix'){
+      var n=matrixSize, A=[], b=[];
+      for(var i=0;i<n;i++){
+        var row=[];
+        for(var j=0;j<n;j++) row.push(parseFloat(document.getElementById('a'+i+j).value)||0);
+        A.push(row);
+        b.push(parseFloat(document.getElementById('b'+i).value)||0);
+      }
+      payload.A=A; payload.b=b;
+    } else if(currentMode==='equation'){
+      var text=document.getElementById('eq-input').value;
+      var equations=text.split('\n').map(function(s){return s.trim();}).filter(Boolean);
+      if(!equations.length) throw new Error('Enter at least one equation');
+      payload.equations=equations;
+    } else {
+      var domainType=document.getElementById('domain-select').value;
+      var domainParams={};
+      (DOMAIN_FIELDS[domainType]||[]).forEach(function(f){
+        var el=document.getElementById('dp-'+f.id);
+        domainParams[f.id]=el?(parseFloat(el.value)||f.def):f.def;
+      });
+      payload.domainType=domainType; payload.domainParams=domainParams;
+    }
+    var res=await fetch('/solve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    var data=await res.json();
+    if(data.error) throw new Error(data.error);
+    renderResult(data);
+    loadHistory();
+  } catch(e){ renderError(e.message); }
+  finally{ btn.disabled=false; btn.classList.remove('loading'); label.textContent='\u26A1 Solve System'; }
+}
 
-            for (const [name, label, val] of config.fields) {
-                const wrap = document.createElement('div');
-                const l = document.createElement('label');
-                l.textContent = label;
-                l.style.marginBottom = '6px';
-                const input = document.createElement('input');
-                input.type = 'number';
-                input.step = 'any';
-                input.id = `domain_${name}`;
-                input.value = val;
-                wrap.appendChild(l);
-                wrap.appendChild(input);
-                container.appendChild(wrap);
-            }
-        }
+function renderResult(data){
+  document.getElementById('result-placeholder').style.display='none';
+  var rc=document.getElementById('result-content'); rc.style.display='block';
+  var converged=data.converged, vars=data.variables||[], sol=data.solution||[], diag=data.diagnostics||{}, iters=data.iterations||[];
+  var html='<div class="result-card">';
+  if(data.domainTitle) html+='<div style="font-size:13px;font-weight:700;color:var(--accent);margin-bottom:12px;letter-spacing:.04em;text-transform:uppercase;">'+data.domainTitle+'</div>';
+  html+='<div class="result-status '+(converged?'converged':'diverged')+'">'
+      +'<span class="status-icon">'+(converged?'\u2705':'\u26A0\uFE0F')+'</span>'
+      +'<span>'+(converged?'Converged in '+data.iterCount+' iterations':'Did not converge after '+data.iterCount+' iterations')+'</span></div>';
+  html+='<div class="form-label">Solution</div><div class="solution-grid">';
+  vars.forEach(function(v,i){
+    html+='<div class="solution-var"><div class="solution-var-name">'+v+'</div>'
+        +'<div class="solution-var-val">'+(sol[i]!==undefined?Number(sol[i]).toFixed(6):'\u2014')+'</div></div>';
+  });
+  html+='</div>';
+  if(diag.stability){
+    html+='<div class="form-label" style="margin-top:16px;">Diagnostics</div><div class="diag-grid">'
+        +'<div class="diag-item"><div class="diag-key">Stability</div><div class="diag-val stability-'+diag.stability+'">'+diag.stability.toUpperCase()+'</div></div>'
+        +'<div class="diag-item"><div class="diag-key">Residual \u2016r\u2016\u221E</div><div class="diag-val mono">'+Number(diag.residualInfinityNorm).toExponential(3)+'</div></div>'
+        +'<div class="diag-item"><div class="diag-key">Strict Dominant Rows</div><div class="diag-val">'+diag.strictDominantRows+' / '+vars.length+'</div></div>'
+        +'<div class="diag-item"><div class="diag-key">Min Margin</div><div class="diag-val mono">'+Number(diag.minimumMargin).toFixed(4)+'</div></div>'
+        +'</div>';
+  }
+  html+='</div>';
+  if(iters.length){
+    html+='<div class="result-card"><div class="form-label">Iteration Log</div><div class="iter-table-wrap"><table class="iter-table"><thead><tr><th>Iter</th><th>Max \u03B4</th>';
+    vars.forEach(function(v){html+='<th>'+v+'</th>';});
+    html+='</tr></thead><tbody>';
+    iters.slice(0,15).forEach(function(it){
+      html+='<tr><td class="mono">'+it.number+'</td><td class="mono">'+Number(it.maxDelta).toExponential(3)+'</td>';
+      (it.details||[]).forEach(function(d){html+='<td class="mono">'+Number(d.value).toFixed(6)+'</td>';});
+      html+='</tr>';
+    });
+    if(iters.length>15) html+='<tr><td colspan="'+(vars.length+2)+'" style="text-align:center;color:var(--ink3);font-size:12px;padding:12px;">\u2026 '+(iters.length-15)+' more rows</td></tr>';
+    html+='</tbody></table></div></div>';
+  }
+  rc.innerHTML=html;
+  rc.scrollIntoView({behavior:'smooth',block:'nearest'});
+}
 
-        async function solve() {
-            const resultsDiv = document.getElementById('results');
-            const solveBtn = document.querySelector('.solve-btn');
-            const solveText = document.getElementById('solveText');
+function renderError(msg){
+  document.getElementById('result-placeholder').style.display='none';
+  var rc=document.getElementById('result-content'); rc.style.display='block';
+  rc.innerHTML='<div class="result-card" style="border-color:#FCA5A5;">'
+             +'<div class="result-status" style="background:#FEF2F2;color:#DC2626;">'
+             +'<span class="status-icon">\u274C</span> Error: '+msg+'</div></div>';
+}
 
-            solveBtn.disabled = true;
-            solveText.innerHTML = '<span class="loading"></span>Computing...';
-            resultsDiv.style.display = 'none';
+async function loadHistory(){
+  try{
+    var res=await fetch('/history?limit=20');
+    var data=await res.json();
+    var list=document.getElementById('history-list');
+    if(!data.history||!data.history.length){
+      list.innerHTML='<div style="color:var(--ink3);font-size:14px;padding:32px 0;text-align:center;">No solves yet \u2014 run your first system above!</div>';
+      return;
+    }
+    list.innerHTML=data.history.map(function(h){
+      var vars=h.variables||[];
+      var preview=vars.slice(0,3).map(function(v,i){return v+'='+Number(h.solution[i]).toFixed(4);}).join(', ');
+      return '<div class="history-item">'
+           +'<div><div style="font-size:14px;font-weight:600;color:var(--ink);margin-bottom:4px;">'+h.mode.toUpperCase()+' \u00B7 '+h.iterCount+' iters</div>'
+           +'<div class="history-item-meta mono">'+preview+'</div>'
+           +'<div class="history-item-meta" style="margin-top:3px;">'+h.createdAt+'</div></div>'
+           +'<span class="history-badge '+(h.converged?'badge-converged':'badge-diverged')+'">'+(h.converged?'Converged':'Diverged')+'</span>'
+           +'</div>';
+    }).join('');
+  } catch(e){
+    document.getElementById('history-list').innerHTML='<div style="color:var(--ink3);font-size:14px;padding:24px 0;text-align:center;">Could not load history.</div>';
+  }
+}
 
-            try {
-                const tolerance = parseFloat(document.getElementById('tolerance').value);
-                const maxIterations = parseInt(document.getElementById('maxIterations').value);
+async function clearHistory(){
+  if(!confirm('Clear all solve history?')) return;
+  await fetch('/history/clear',{method:'POST'});
+  loadHistory();
+}
 
-                if (isNaN(tolerance) || tolerance <= 0) throw new Error('Tolerance must be a positive number');
-                if (isNaN(maxIterations) || maxIterations < 1) throw new Error('Maximum iterations must be at least 1');
+function activateDomain(d){
+  setMode('domain',document.querySelectorAll('.mode-tab')[2]);
+  document.getElementById('domain-select').value=d;
+  renderDomainFields();
+  document.getElementById('solver').scrollIntoView({behavior:'smooth'});
+}
 
-                let requestData = { mode: currentMode, tol: tolerance, maxIter: maxIterations };
-
-                if (currentMode === 'matrix') {
-                    const n = parseInt(document.getElementById('matrixSize').value);
-                    const A = [];
-                    const b = [];
-
-                    for (let i = 0; i < n; i++) {
-                        const row = [];
-                        for (let j = 0; j < n; j++) {
-                            const val = parseFloat(document.getElementById(`a${i}_${j}`).value);
-                            if (isNaN(val)) throw new Error('Invalid matrix entry');
-                            row.push(val);
-                        }
-                        A.push(row);
-
-                        const bVal = parseFloat(document.getElementById(`b${i}`).value);
-                        if (isNaN(bVal)) throw new Error('Invalid constant');
-                        b.push(bVal);
-                    }
-
-                    requestData.A = A;
-                    requestData.b = b;
-                } else if (currentMode === 'equation') {
-                    const n = parseInt(document.getElementById('numEquations').value);
-                    const equations = [];
-
-                    for (let i = 0; i < n; i++) {
-                        const eq = document.getElementById(`eq${i}`).value.trim();
-                        if (!eq) throw new Error(`Equation ${i+1} is empty`);
-                        equations.push(eq);
-                    }
-
-                    requestData.equations = equations;
-                } else {
-                    const domainType = document.getElementById('domainType').value;
-                    const config = getDomainConfig(domainType);
-                    const params = {};
-                    for (const [name] of config.fields) {
-                        const val = parseFloat(document.getElementById(`domain_${name}`).value);
-                        if (isNaN(val)) throw new Error(`Invalid domain value: ${name}`);
-                        params[name] = val;
-                    }
-                    requestData.domainType = domainType;
-                    requestData.domainParams = params;
-                }
-
-                const response = await fetch('/solve', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify(requestData)
-                });
-
-                const result = await response.json();
-
-                if (result.error) {
-                    throw new Error(result.error);
-                }
-
-                lastResult = result;
-                displayResults(result);
-                await loadHistory();
-
-            } catch (error) {
-                resultsDiv.innerHTML = `<div class="error-message"><strong>Error:</strong> ${error.message}</div>`;
-                resultsDiv.style.display = 'block';
-            } finally {
-                solveBtn.disabled = false;
-                solveText.innerHTML = 'Compute Solution';
-            }
-        }
-
-        async function loadHistory() {
-            const historyPanel = document.getElementById('historyPanel');
-            const response = await fetch('/history');
-            const payload = await response.json();
-
-            if (payload.error) {
-                historyPanel.innerHTML = `<div class="error-message"><strong>Error:</strong> ${payload.error}</div>`;
-                return;
-            }
-
-            const items = payload.history || [];
-            if (items.length === 0) {
-                historyPanel.innerHTML = '<div class="history-item">No saved calculations yet. Solve a system to build your history.</div>';
-                return;
-            }
-
-            let html = '<div class="history-title">Saved Calculation History</div>';
-            for (const item of items) {
-                const solutionText = item.variables
-                    .map((name, idx) => `${name}=${Number(item.solution[idx]).toFixed(4)}`)
-                    .join(', ');
-
-                html += '<div class="history-item">';
-                html += `<div class="history-meta">#${item.id} • ${item.createdAt}</div>`;
-                html += `<div><strong>Mode:</strong> ${item.mode} | <strong>tol:</strong> ${item.tol} | <strong>maxIter:</strong> ${item.maxIter}</div>`;
-                html += `<div><strong>Status:</strong> ${item.converged ? 'Converged' : 'Not converged'} in ${item.iterCount} iterations</div>`;
-                html += `<span class="history-status ${item.converged ? 'ok' : 'warn'}">${item.converged ? 'stable result' : 'needs tuning'}</span>`;
-                html += `<div><strong>Solution:</strong> ${solutionText}</div>`;
-                if (item.diagnostics && item.diagnostics.residualInfinityNorm !== undefined) {
-                    html += `<div><strong>Residual ||Ax-b||∞:</strong> ${Number(item.diagnostics.residualInfinityNorm).toExponential(3)}</div>`;
-                }
-                html += '</div>';
-            }
-            historyPanel.innerHTML = html;
-        }
-
-        async function toggleHistory() {
-            const historyPanel = document.getElementById('historyPanel');
-            const show = historyPanel.style.display === 'none';
-            historyPanel.style.display = show ? 'block' : 'none';
-            if (show) {
-                await loadHistory();
-            }
-        }
-
-        async function clearHistoryRecords() {
-            await fetch('/history/clear', { method: 'POST' });
-            const historyPanel = document.getElementById('historyPanel');
-            if (historyPanel.style.display !== 'none') {
-                await loadHistory();
-            }
-        }
-
-        function buildExplanationHtml(result) {
-            const domainText = result.domainTitle
-                ? `This run used the domain template: <code>${result.domainTitle}</code>.`
-                : 'This run used your direct matrix/equation inputs.';
-
-            const firstLogged = (result.iterations && result.iterations.length > 0) ? result.iterations[0] : null;
-            let firstIterHtml = '';
-            if (firstLogged) {
-                const samples = firstLogged.details
-                    .map(d => `<li><code>${d.variable}</code> updated to <code>${Number(d.value).toFixed(6)}</code> (Δ=${Number(d.delta).toExponential(2)})</li>`)
-                    .join('');
-                firstIterHtml = `<p><strong>First logged iteration (Iteration ${firstLogged.number}):</strong></p><ul>${samples}</ul>`;
-            }
-
-            const diagnostics = result.diagnostics || {};
-            const stability = diagnostics.stability ? diagnostics.stability.toUpperCase() : 'N/A';
-            const residual = diagnostics.residualInfinityNorm !== undefined
-                ? Number(diagnostics.residualInfinityNorm).toExponential(3)
-                : 'N/A';
-
-            return `
-                <h3>How to do it (Gauss-Seidel method)</h3>
-                <ul>
-                    <li>Start with an initial guess for all unknowns (this app uses 0 for each variable).</li>
-                    <li>Rearrange each equation in iterative form and update each variable sequentially.</li>
-                    <li>After each full pass, compute max change <code>max |xᵢ(new)-xᵢ(old)|</code>.</li>
-                    <li>Stop when max change is below tolerance or when max iterations is reached.</li>
-                </ul>
-                <p>${domainText}</p>
-                ${firstIterHtml}
-                <p><strong>Convergence summary:</strong> ${result.converged ? 'Converged' : 'Not converged'} in ${result.iterCount} iterations.</p>
-                <p><strong>Diagnostics summary:</strong> Stability <code>${stability}</code>, residual norm <code>${residual}</code>.</p>
-            `;
-        }
-
-        function toggleExplanation() {
-            const panel = document.getElementById('explanationPanel');
-            const show = panel.style.display === 'none';
-            panel.style.display = show ? 'block' : 'none';
-
-            if (!show) return;
-
-            if (!lastResult) {
-                panel.innerHTML = `
-                    <h3>How to do it (Gauss-Seidel method)</h3>
-                    <p>Run a solve first, then click this button again to see a step-by-step explanation using your own result.</p>
-                    <ul>
-                        <li>Pick mode (Matrix, Equation, or Domain Model).</li>
-                        <li>Enter coefficients/constants and solver settings.</li>
-                        <li>Press <code>Compute Solution</code>.</li>
-                        <li>Open this explanation panel for a guided breakdown.</li>
-                    </ul>
-                `;
-                return;
-            }
-
-            panel.innerHTML = buildExplanationHtml(lastResult);
-        }
-
-        function displayResults(result) {
-            const resultsDiv = document.getElementById('results');
-            let html = '<div class="results-header">Iteration Log</div>';
-            html += '<div class="results-content">';
-
-            for (const iter of result.iterations) {
-                html += `<div class="iteration-block">`;
-                html += `<div class="iteration-header">Iteration ${iter.number}</div>`;
-                
-                for (const detail of iter.details) {
-                    html += `<div class="variable-value">`;
-                    html += `<span><span class="variable-name">${detail.variable}</span> = <span class="variable-number">${detail.value.toFixed(6)}</span></span>`;
-                    html += `<span class="delta">Δ ${detail.delta.toExponential(2)}</span>`;
-                    html += `</div>`;
-                }
-
-                html += `<div class="max-change">`;
-                html += `Maximum change: ${iter.maxDelta.toExponential(2)}`;
-                html += `</div>`;
-                html += `</div>`;
-            }
-
-            html += '</div>';
-
-            if (result.domainTitle) {
-                html += `<div class="result-domain">🚀 Domain Solver: ${result.domainTitle}</div>`;
-            }
-
-            if (result.diagnostics) {
-                const d = result.diagnostics;
-                const stabilityText = {
-                    excellent: 'Excellent stability (strict diagonal dominance in every row).',
-                    fair: 'Fair stability (some rows are weakly dominant).',
-                    risky: 'Risky stability (non-dominant rows may slow or prevent convergence).'
-                };
-
-                html += '<div class="diagnostics-panel">';
-                html += '<h3>Competition Edge: Convergence Diagnostics</h3>';
-                html += `<p><strong>Stability grade:</strong> ${d.stability.toUpperCase()} — ${stabilityText[d.stability] || ''}</p>`;
-                html += `<p><strong>Minimum dominance margin:</strong> ${d.minimumMargin.toExponential(3)}</p>`;
-                html += `<p><strong>Residual ||Ax-b||∞:</strong> ${d.residualInfinityNorm.toExponential(3)}</p>`;
-
-                html += '<table class="diagnostics-table">';
-                html += '<tr><th>Row</th><th>|aᵢᵢ|</th><th>Σ|aᵢⱼ|, j≠i</th><th>Margin</th><th>Ratio</th><th>Status</th></tr>';
-                for (const row of d.rowMetrics) {
-                    const ratioText = Number.isFinite(row.ratio) ? row.ratio.toFixed(3) : '∞';
-                    html += '<tr>';
-                    html += `<td>${row.row}</td>`;
-                    html += `<td>${row.diagAbs.toFixed(4)}</td>`;
-                    html += `<td>${row.offDiagAbs.toFixed(4)}</td>`;
-                    html += `<td>${row.margin.toExponential(2)}</td>`;
-                    html += `<td>${ratioText}</td>`;
-                    html += `<td><span class="status-pill status-${row.status}">${row.status.replace('_', ' ')}</span></td>`;
-                    html += '</tr>';
-                }
-                html += '</table>';
-                html += '</div>';
-            }
-
-            if (result.converged) {
-                html += '<div class="final-solution">';
-                html += `<h3>Solution <span class="badge">Converged in ${result.iterCount} iterations</span></h3>`;
-                for (let i = 0; i < result.variables.length; i++) {
-                    html += `<div class="solution-item">`;
-                    html += `<span>${result.variables[i]}</span>`;
-                    html += `<span>${result.solution[i].toFixed(6)}</span>`;
-                    html += `</div>`;
-                }
-                html += '</div>';
-            } else {
-                html += '<div class="error-message">Solution did not converge within the maximum number of iterations.</div>';
-            }
-
-            resultsDiv.innerHTML = html;
-            resultsDiv.style.display = 'block';
-        }
-
-        // Initialize
-        generateMatrixInputs();
-        generateDomainInputs();
-    </script>
+buildMatrix();
+renderDomainFields();
+loadHistory();
+</script>
 </body>
-</html>
-'''
+</html>"""
 
+
+# ────────────────────────────────────────────────
+# Flask Routes
+# ────────────────────────────────────────────────
 
 @app.route('/')
 def index():
-    """Serve the main HTML page"""
     return render_template_string(HTML_TEMPLATE)
 
 
 @app.route('/solve', methods=['POST'])
 def solve():
-    """Solve the linear system using Gauss-Seidel method"""
     try:
         data = request.json
         mode = data.get('mode')
@@ -1668,24 +968,17 @@ def solve():
             A = data.get('A')
             b = data.get('b')
             n = len(A)
-            variables = [chr(120 + i) for i in range(n)]  # x, y, z, ...
+            variables = [chr(120 + i) for i in range(n)]
             input_payload = {'A': A, 'b': b}
 
         elif mode == 'equation':
             equations = data.get('equations')
-            
-            # Extract all variables
             all_vars = set()
             for eq in equations:
-                matches = re.findall(r'[a-zA-Z]', eq)
-                all_vars.update(matches)
-            
+                all_vars.update(re.findall(r'[a-zA-Z]', eq))
             variables = sorted(all_vars)
             var_to_idx = {v: i for i, v in enumerate(variables)}
-            
-            # Parse equations
-            A = []
-            b = []
+            A, b = [], []
             for eq in equations:
                 coeffs, const = parse_equation(eq, var_to_idx)
                 A.append(coeffs)
@@ -1696,35 +989,20 @@ def solve():
             domain_type = data.get('domainType')
             domain_params = data.get('domainParams', {})
             A, b, variables, domain_title = build_domain_system(domain_type, domain_params)
-            input_payload = {
-                'domainType': domain_type,
-                'domainParams': domain_params,
-            }
+            input_payload = {'domainType': domain_type, 'domainParams': domain_params}
 
         else:
             return jsonify({'error': 'Invalid mode'}), 400
 
-        # Prepare matrix
         A, b = prepare_matrix(A, b)
-
-        # Solve
         result = gauss_seidel(A, b, variables, tol=tol, max_iter=max_iter)
         result['variables'] = variables
         result['diagnostics'] = analyze_system(A, b, result['solution'])
         if mode == 'domain':
             result['domainTitle'] = domain_title
 
-        save_history_entry(
-            {
-                'mode': mode,
-                'tol': tol,
-                'maxIter': max_iter,
-                'variables': variables,
-                'input': input_payload,
-            },
-            result,
-        )
-
+        save_history_entry({'mode': mode, 'tol': tol, 'maxIter': max_iter,
+                            'variables': variables, 'input': input_payload}, result)
         return jsonify(result)
 
     except Exception as e:
@@ -1733,10 +1011,8 @@ def solve():
 
 @app.route('/history', methods=['GET'])
 def history():
-    """Return latest solver calculations from SQLite history."""
     try:
-        limit = int(request.args.get('limit', 20))
-        limit = max(1, min(limit, 100))
+        limit = max(1, min(100, int(request.args.get('limit', 20))))
         return jsonify({'history': fetch_history(limit)})
     except Exception as e:
         return jsonify({'error': str(e)}), 400
@@ -1744,7 +1020,6 @@ def history():
 
 @app.route('/history/clear', methods=['POST'])
 def clear_history_route():
-    """Clear all persisted history entries."""
     try:
         clear_history()
         return jsonify({'ok': True})
@@ -1753,9 +1028,9 @@ def clear_history_route():
 
 
 if __name__ == '__main__':
-    print("\n" + "="*50)
+    print("\n" + "=" * 50)
     print("  GAUSS-SEIDEL SOLVER - WEB APPLICATION")
-    print("="*50)
+    print("=" * 50)
     print("\nStarting server...")
     print("Open your browser and go to: http://127.0.0.1:5000")
     print("\nPress Ctrl+C to stop the server\n")
